@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,33 +6,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 import plotly.express as px
 import plotly.graph_objects as go
-import base64
 
-st.set_page_config(page_title="FIELDWISE AI V3", page_icon="⛽", layout="wide")
-
-# ---------- Add Background Image ----------
-def add_bg_from_local(image_file):
-    try:
-        with open(image_file, "rb") as file:
-            encoded_string = base64.b64encode(file.read()).decode()
-        st.markdown(
-            f"""
-            <style>
-            .stApp {{
-                background-image: linear-gradient(rgba(7, 16, 24, 0.85), rgba(7, 16, 24, 0.95)), url("data:image/jpeg;base64,{encoded_string}");
-                background-size: cover;
-                background-position: center;
-                background-attachment: fixed;
-            }}
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-    except FileNotFoundError:
-        pass
-
-add_bg_from_local("Gemini_Generated_Image_nh5w0bnh5w0bnh5w.jpg")
-# ------------------------------------------
+st.set_page_config(page_title="FIELDWISE AI", page_icon="⛽", layout="wide")
 
 # ---------- Synthetic demo data ----------
 @st.cache_data
@@ -104,8 +80,25 @@ def section(title, kicker=""):
 # ---------- Styling ----------
 st.markdown("""
 <style>
-.stApp { background: #071018; color: #EAF2F7; }
+ .stApp {
+  background:
+    radial-gradient(circle at 84% 7%, rgba(73, 174, 158, .13), transparent 25%),
+    radial-gradient(circle at 12% 88%, rgba(45, 103, 133, .13), transparent 30%),
+    linear-gradient(135deg, #061017 0%, #091720 50%, #071018 100%);
+  color: #EAF2F7;
+}
+.stApp:before {
+  content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .18;
+  background-image: linear-gradient(rgba(112,171,184,.055) 1px, transparent 1px), linear-gradient(90deg, rgba(112,171,184,.055) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: linear-gradient(to bottom, black, transparent 82%);
+}
 .block-container { padding-top: 1.2rem; max-width: 1450px; }
+[data-testid="stSidebar"] { background: linear-gradient(180deg,#07131b 0%,#091821 100%); border-right:1px solid #20323d; }
+[data-testid="stSidebar"] > div:first-child { padding-top:1.2rem; }
+[data-testid="stSidebar"] .stRadio > label { color:#8EA3AE; font-size:11px; text-transform:uppercase; letter-spacing:1.4px; }
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"] { gap:5px; }
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label { border-radius:9px; padding:7px 9px; }
 .hero {
   padding: 34px 38px; border: 1px solid #233541; border-radius: 20px;
   background: linear-gradient(135deg,#0c1d28,#0a141b);
@@ -131,7 +124,7 @@ st.markdown("""
 
 # ---------- Sidebar ----------
 st.sidebar.markdown("## FIELDWISE AI")
-st.sidebar.caption("V3 • Mature Field Decision Support")
+st.sidebar.caption("Mature Field Decision Support")
 page = st.sidebar.radio(
     "Navigation",
     ["Command Center","Well Intelligence","Intervention Lab","Field Analytics","Explainable AI","Methodology"]
@@ -144,7 +137,7 @@ st.sidebar.caption("All numerical results are illustrative and must be validated
 # ---------- Header ----------
 st.markdown("""
 <div class="hero">
- <div class="brand">FIELDWISE AI · V3</div>
+ <div class="brand">FIELDWISE AI</div>
  <span class="badge">MATURE FIELD INTELLIGENCE</span>
  <h1>From Field History to Future Recovery.</h1>
  <p>AI-assisted production intelligence that learns from historical field behaviour,
@@ -161,7 +154,7 @@ if page == "Command Center":
     high = (latest.Priority.isin(["HIGH","CRITICAL"])).sum()
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Active wells", active, "Demo field")
-    with c2: kpi_card("Current oil", f"{oil:,.0f}", "field units / day")
+    with c2: kpi_card("Current oil", f"{oil:,.0f} m³/d", "field total")
     with c3: kpi_card("Weighted water cut", f"{wc:.1f}%", "production weighted")
     with c4: kpi_card("High-priority wells", high, "AI screening queue")
 
@@ -203,10 +196,10 @@ elif page == "Well Intelligence":
     wc = row.Water_Cut
 
     c1,c2,c3,c4,c5 = st.columns(5)
-    with c1:kpi_card("Oil rate",f"{row.Oil_Rate:.1f}","current")
-    with c2:kpi_card("Water rate",f"{row.Water_Rate:.1f}","current")
+    with c1:kpi_card("Oil rate",f"{row.Oil_Rate:.1f} m³/d","current")
+    with c2:kpi_card("Water rate",f"{row.Water_Rate:.1f} m³/d","current")
     with c3:kpi_card("Water cut",f"{wc:.1f}%","current")
-    with c4:kpi_card("BHP",f"{row.Bottomhole_Pressure:.1f}","demo pressure units")
+    with c4:kpi_card("BHP",f"{row.Bottomhole_Pressure:.1f} bar","current")
     with c5:kpi_card("Priority",row.Priority,"AI screening")
 
     a,b=st.columns(2)
@@ -238,7 +231,7 @@ elif page == "Intervention Lab":
     well=st.selectbox("Well for scenario", latest.Well.tolist())
     row=latest[latest.Well==well].iloc[0]
     current=row.Injection_Rate
-    proposed=st.slider("Proposed injection rate",0.0,120.0,float(np.clip(current,0,120)),1.0)
+    proposed=st.slider("Proposed injection rate (m³/d)",0.0,120.0,float(np.clip(current,0,120)),1.0)
     run=st.button("RUN AI SCENARIO", type="primary", use_container_width=True)
 
     if run:
@@ -258,16 +251,16 @@ elif page == "Intervention Lab":
         pred_wc=pred_water/(pred_water+pred_oil)*100
 
         c1,c2,c3,c4=st.columns(4)
-        with c1:kpi_card("Predicted oil",f"{pred_oil:.1f}","proxy-model estimate")
-        with c2:kpi_card("Estimated water",f"{pred_water:.1f}","demo response")
+        with c1:kpi_card("Predicted oil",f"{pred_oil:.1f} m³/d","proxy-model estimate")
+        with c2:kpi_card("Estimated water",f"{pred_water:.1f} m³/d","demo response")
         with c3:kpi_card("Estimated water cut",f"{pred_wc:.1f}%","demo response")
-        with c4:kpi_card("Suggested injection",f"{best_inj:.0f}","screening optimum")
+        with c4:kpi_card("Suggested injection",f"{best_inj:.0f} m³/d","screening optimum")
 
         fig=go.Figure()
         fig.add_trace(go.Scatter(x=scenarios,y=oil_preds,name="Predicted oil",mode="lines"))
         fig.add_vline(x=proposed,line_dash="dash",annotation_text="Proposed")
         fig.add_vline(x=best_inj,line_dash="dot",annotation_text="Screening optimum")
-        fig.update_layout(template="plotly_dark",height=360,xaxis_title="Injection rate",yaxis_title="Predicted oil rate")
+        fig.update_layout(template="plotly_dark",height=360,xaxis_title="Injection rate (m³/d)",yaxis_title="Predicted oil rate (m³/d)")
         st.plotly_chart(fig,use_container_width=True)
 
         delta=pred_oil-base_pred
@@ -345,7 +338,7 @@ elif page == "Explainable AI":
     lo=min(test_df.Oil_Rate.min(),test_df.Predicted_Oil.min())
     hi=max(test_df.Oil_Rate.max(),test_df.Predicted_Oil.max())
     fig.add_shape(type="line",x0=lo,y0=lo,x1=hi,y1=hi)
-    fig.update_layout(template="plotly_dark",height=380,xaxis_title="Actual oil rate",yaxis_title="Predicted oil rate")
+    fig.update_layout(template="plotly_dark",height=380,xaxis_title="Actual oil rate",yaxis_title="Predicted oil rate (m³/d)")
     st.plotly_chart(fig,use_container_width=True)
 
 # ---------- Methodology ----------
