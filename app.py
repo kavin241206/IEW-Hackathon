@@ -133,6 +133,7 @@ st.sidebar.divider()
 st.sidebar.caption("DEMO MODE")
 st.sidebar.write("Synthetic field dataset")
 st.sidebar.caption("All numerical results are illustrative and must be validated before operational use.")
+st.sidebar.markdown("<div style=\"margin-top:28px; padding-top:10px; border-top:1px solid #20323d; color:#6F858F; font-size:11px; letter-spacing:.5px; text-align:center;\">designed by Kavinkarthick</div>", unsafe_allow_html=True)
 
 # ---------- Header ----------
 st.markdown("""
