@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -65,19 +66,19 @@ def priority(row):
 latest["Priority"] = latest.apply(priority, axis=1)
 
 def kpi_card(label, value, sub=""):
-    st.markdown(f'''
+    st.markdown(f"""
     <div class="kpi">
       <div class="kpi-label">{label}</div>
       <div class="kpi-value">{value}</div>
       <div class="kpi-sub">{sub}</div>
     </div>
-    ''', unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 def section(title, kicker=""):
     st.markdown(f'<div class="section-kicker">{kicker}</div><h2 class="section-title">{title}</h2>', unsafe_allow_html=True)
 
 # ---------- Styling ----------
-st.markdown('''
+st.markdown("""
 <style>
 .stApp { background: #071018; color: #EAF2F7; }
 .block-container { padding-top: 1.2rem; max-width: 1450px; }
@@ -102,10 +103,9 @@ st.markdown('''
 .small { color:#8EA3AE; font-size:13px; }
 .reco { font-size:20px; font-weight:800; }
 </style>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # ---------- Sidebar ----------
-st.sidebar.image("Gemini_Generated_Image_nh5w0bnh5w0bnh5w.jpg", use_container_width=True)
 st.sidebar.markdown("## FIELDWISE AI")
 st.sidebar.caption("V3 • Mature Field Decision Support")
 page = st.sidebar.radio(
@@ -118,7 +118,7 @@ st.sidebar.write("Synthetic field dataset")
 st.sidebar.caption("All numerical results are illustrative and must be validated before operational use.")
 
 # ---------- Header ----------
-st.markdown('''
+st.markdown("""
 <div class="hero">
  <div class="brand">FIELDWISE AI · V3</div>
  <span class="badge">MATURE FIELD INTELLIGENCE</span>
@@ -126,7 +126,7 @@ st.markdown('''
  <p>AI-assisted production intelligence that learns from historical field behaviour,
  rapidly evaluates operating scenarios, and prioritises wells for engineering attention.</p>
 </div>
-''', unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
 # ---------- Command Center ----------
 if page == "Command Center":
@@ -224,6 +224,7 @@ elif page == "Intervention Lab":
         X=np.repeat(base,31,axis=0)
         X[:,features.index("Injection_Rate")]=scenarios
         oil_preds=model.predict(X)
+        # Conservative demo-only water response heuristic
         water_preds=np.maximum(2,row.Water_Rate*(1+0.003*(scenarios-current)))
         wc_preds=water_preds/(water_preds+oil_preds)*100
         idx=int(np.argmin(np.where(wc_preds>55, 1e6, -oil_preds)))
@@ -344,10 +345,10 @@ elif page == "Methodology":
     st.write(f"Chronological held-out test evaluation is used. Demonstration test-set MAE: **{mae:.2f} oil-rate units**.")
     st.warning("All field values, well coordinates and scenario-response assumptions in this prototype are synthetic. Before operational deployment, the workflow requires validated field data, proper time-series validation, uncertainty analysis, reservoir/production constraints, facility constraints and engineering review.")
     section("Innovation statement","WHY THIS IS DIFFERENT")
-    st.markdown('''
+    st.markdown("""
     <div class="alert">
     <b>FIELDWISE AI is not positioned as a replacement for a physics-based reservoir simulator.</b><br><br>
     It is a decision-support layer that learns from mature-field history, screens well-level opportunities,
     rapidly evaluates operating scenarios and communicates recommendations in an engineer-friendly interface.
     </div>
-    ''',unsafe_allow_html=True)
+    """,unsafe_allow_html=True)
