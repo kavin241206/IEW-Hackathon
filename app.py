@@ -2,538 +2,353 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
+import plotly.express as px
+import plotly.graph_objects as go
 
-# =========================================================
-# FIELDWISE AI — V2
-# =========================================================
-st.set_page_config(
-    page_title="FIELDWISE AI | Mature Field Intelligence",
-    page_icon="🛢️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="FIELDWISE AI V3", page_icon="⛽", layout="wide")
 
-# ------------------------- DATA --------------------------
+# ---------- Synthetic demo data ----------
 @st.cache_data
-def create_demo_data():
-    rng = np.random.default_rng(24)
-    dates = pd.date_range("2023-01-01", "2026-09-01", freq="MS")
-    wells = [f"W-{i:03d}" for i in range(1, 25)]
+def make_data():
+    rng = np.random.default_rng(42)
+    dates = pd.date_range("2024-01-01", periods=180, freq="D")
+    wells = [f"W-{i:03d}" for i in range(1, 13)]
     rows = []
-
     for wi, well in enumerate(wells):
-        base_oil = rng.uniform(155, 335)
-        base_water = rng.uniform(260, 590)
-        base_gas = rng.uniform(90, 255)
-        base_inj = rng.uniform(560, 900)
-        base_bhp = rng.uniform(1280, 1780)
-
-        for m, date in enumerate(dates):
-            decline = np.exp(-0.0108 * m)
-            season = 1 + 0.022*np.sin(m/4.2 + wi)
-            injection = np.clip(
-                base_inj + 48*np.sin(m/5 + wi) + rng.normal(0, 16),
-                450, 1100
-            )
-            bhp = base_bhp - 1.35*m + 0.34*(injection-base_inj) + rng.normal(0, 13)
-            water = max(
-                base_water*(1 + 0.0087*m)
-                + 0.11*max(injection-base_inj, 0)
-                + rng.normal(0, 20), 80
-            )
-            oil = max(
-                base_oil*decline*season
-                + 0.070*(injection-base_inj)
-                + 0.022*(bhp-base_bhp)
-                + rng.normal(0, 7), 42
-            )
-            gas = max(base_gas*(0.94 + 0.06*decline) + rng.normal(0, 10), 20)
-            whp = max(350, bhp - 430 + rng.normal(0, 12))
-            wc = water/(water+oil)
-
-            rows.append([
-                date, well, oil, water, gas, whp, bhp,
-                injection, wc
-            ])
-
+        base_oil = 145 - wi * 5 + rng.normal(0, 4)
+        base_water = 30 + wi * 4
+        for t, d in enumerate(dates):
+            decline = np.exp(-t / (260 + wi * 15))
+            injection = 55 + 10*np.sin(t/25 + wi/3) + rng.normal(0, 3)
+            bhp = 190 - wi*2 + 7*np.sin(t/30 + wi) + rng.normal(0, 2)
+            whp = 105 - wi + 4*np.sin(t/18) + rng.normal(0, 1.5)
+            water = max(5, base_water + 0.055*t + 0.16*injection + rng.normal(0, 3))
+            gas = max(20, 65 + 12*np.sin(t/20 + wi) + rng.normal(0, 5))
+            oil = max(15, base_oil*decline + 0.26*injection + 0.15*bhp - 20
+                       - 0.10*water + rng.normal(0, 4))
+            rows.append([d, well, oil, water, gas, whp, bhp, injection])
     return pd.DataFrame(rows, columns=[
-        "Date","Well_ID","Oil_Rate","Water_Rate","Gas_Rate",
-        "Wellhead_Pressure","Bottomhole_Pressure","Injection_Rate","Water_Cut"
+        "Date","Well","Oil_Rate","Water_Rate","Gas_Rate",
+        "Wellhead_Pressure","Bottomhole_Pressure","Injection_Rate"
     ])
 
-df = create_demo_data()
+df = make_data()
+features = ["Water_Rate","Gas_Rate","Wellhead_Pressure","Bottomhole_Pressure","Injection_Rate"]
 
-FEATURES = [
-    "Water_Rate", "Gas_Rate", "Wellhead_Pressure",
-    "Bottomhole_Pressure", "Injection_Rate"
-]
-
-@st.cache_resource
-def train_model(data):
-    ordered = data.sort_values("Date")
-    split = ordered["Date"].quantile(0.80)
-    train = ordered[ordered["Date"] <= split]
-    test = ordered[ordered["Date"] > split]
-
+def train_model():
+    split_date = df["Date"].quantile(0.80)
+    tr = df[df.Date <= split_date]
+    te = df[df.Date > split_date]
     model = RandomForestRegressor(
-        n_estimators=260,
-        max_depth=13,
-        min_samples_leaf=3,
-        random_state=42
+        n_estimators=180, max_depth=10, min_samples_leaf=3, random_state=42
     )
-    model.fit(train[FEATURES], train["Oil_Rate"])
-    pred = model.predict(test[FEATURES])
-    mae = mean_absolute_error(test["Oil_Rate"], pred)
-    return model, mae
+    model.fit(tr[features], tr["Oil_Rate"])
+    pred = model.predict(te[features])
+    return model, mean_absolute_error(te["Oil_Rate"], pred), te.assign(Predicted_Oil=pred)
 
-model, mae = train_model(df)
+model, mae, test_df = train_model()
+latest = df.sort_values("Date").groupby("Well").tail(1).copy()
+latest["Water_Cut"] = latest["Water_Rate"]/(latest["Water_Rate"]+latest["Oil_Rate"])*100
 
-# ----------------------- HELPERS -------------------------
-def latest_snapshot():
-    return df[df["Date"] == df["Date"].max()].copy()
+# ---------- Helpers ----------
+def priority(row):
+    wc = row["Water_Cut"]
+    if row["Oil_Rate"] < 80 and wc > 40:
+        return "CRITICAL"
+    if row["Oil_Rate"] < 95 or wc > 35:
+        return "HIGH"
+    if wc > 28 or row["Oil_Rate"] < 110:
+        return "WATCH"
+    return "STABLE"
 
-def well_stats(well):
-    w = df[df["Well_ID"] == well].sort_values("Date")
-    latest = w.iloc[-1]
-    recent = w.tail(6)["Oil_Rate"].mean()
-    previous = w.iloc[-12:-6]["Oil_Rate"].mean()
-    decline = (recent-previous)/previous*100
-    return w, latest, decline
+latest["Priority"] = latest.apply(priority, axis=1)
 
-def priority_for(well):
-    w, latest, decline = well_stats(well)
-    score = 0
-    if decline < -8: score += 2
-    if latest["Water_Cut"] > 0.70: score += 2
-    elif latest["Water_Cut"] > 0.60: score += 1
-
-    if score >= 3:
-        return "HIGH", score
-    if score >= 2:
-        return "MEDIUM", score
-    return "LOW", score
-
-def scenario_table(well, low=450, high=1100):
-    w, latest, _ = well_stats(well)
-    records = []
-    for inj in range(low, high+1, 25):
-        X = pd.DataFrame([{
-            "Water_Rate": latest["Water_Rate"],
-            "Gas_Rate": latest["Gas_Rate"],
-            "Wellhead_Pressure": latest["Wellhead_Pressure"],
-            "Bottomhole_Pressure": latest["Bottomhole_Pressure"],
-            "Injection_Rate": inj
-        }])
-        oil = float(model.predict(X)[0])
-
-        # Demonstration-only water response heuristic.
-        delta = inj-latest["Injection_Rate"]
-        water = max(
-            50,
-            latest["Water_Rate"]
-            + 0.10*max(delta, 0)
-            - 0.035*max(-delta, 0)
-        )
-        wc = water/(water+oil)
-        records.append([inj, oil, water, wc])
-    return pd.DataFrame(records, columns=[
-        "Injection_Rate","Predicted_Oil","Estimated_Water","Estimated_Water_Cut"
-    ])
-
-# ------------------------ CSS -----------------------------
-st.markdown("""
-<style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-.hero {
-    padding: 28px 30px;
-    border-radius: 18px;
-    border: 1px solid rgba(128,128,128,.22);
-    background: linear-gradient(135deg, rgba(80,110,150,.13), rgba(40,40,40,.04));
-    margin-bottom: 20px;
-}
-.hero h1 {font-size: 46px; margin: 0;}
-.hero p {font-size: 18px; margin: 8px 0 0; opacity: .78;}
-.section-title {font-size: 25px; font-weight: 750; margin-top: 8px;}
-.card {
-    border: 1px solid rgba(128,128,128,.22);
-    border-radius: 15px;
-    padding: 17px;
-    background: rgba(128,128,128,.035);
-}
-.alert {
-    border: 1px solid rgba(210,75,75,.45);
-    border-radius: 14px;
-    padding: 16px;
-    background: rgba(210,75,75,.08);
-}
-.good {
-    border: 1px solid rgba(75,160,100,.45);
-    border-radius: 14px;
-    padding: 16px;
-    background: rgba(75,160,100,.08);
-}
-.muted {opacity:.65; font-size: 12px;}
-</style>
-""", unsafe_allow_html=True)
-
-# ----------------------- SIDEBAR --------------------------
-st.sidebar.markdown("## 🛢️ FIELDWISE AI")
-st.sidebar.caption("Mature-field production intelligence")
-
-page = st.sidebar.radio(
-    "WORKSPACE",
-    [
-        "Command Center",
-        "Well Intelligence",
-        "Scenario Lab",
-        "Field Analytics",
-        "Methodology",
-    ],
-)
-
-st.sidebar.divider()
-st.sidebar.markdown("### Prototype status")
-st.sidebar.success("● DEMONSTRATION READY")
-st.sidebar.caption("Synthetic data • ML proxy • decision-support workflow")
-st.sidebar.divider()
-st.sidebar.caption("FIELDWISE AI V2")
-st.sidebar.caption("Prototype for FIPI / India Energy Week Hackathon")
-
-# =========================================================
-# COMMAND CENTER
-# =========================================================
-if page == "Command Center":
-    snap = latest_snapshot()
-    total_oil = snap["Oil_Rate"].sum()
-    avg_wc = snap["Water_Cut"].mean()
-    high = sum(priority_for(w)[0] == "HIGH" for w in df["Well_ID"].unique())
-
-    st.markdown("""
-    <div class="hero">
-      <h1>FIELDWISE AI</h1>
-      <p>Turning field history into smarter production decisions.</p>
+def kpi_card(label, value, sub=""):
+    st.markdown(f"""
+    <div class="kpi">
+      <div class="kpi-label">{label}</div>
+      <div class="kpi-value">{value}</div>
+      <div class="kpi-sub">{sub}</div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("### Field Command Center")
-    st.caption("A single decision-support view for mature-field performance, well risk and scenario screening.")
+def section(title, kicker=""):
+    st.markdown(f'<div class="section-kicker">{kicker}</div><h2 class="section-title">{title}</h2>', unsafe_allow_html=True)
 
+# ---------- Styling ----------
+st.markdown("""
+<style>
+.stApp { background: #071018; color: #EAF2F7; }
+.block-container { padding-top: 1.2rem; max-width: 1450px; }
+.hero {
+  padding: 34px 38px; border: 1px solid #233541; border-radius: 20px;
+  background: linear-gradient(135deg,#0c1d28,#0a141b);
+  margin-bottom: 22px;
+}
+.brand { font-size: 14px; letter-spacing: 4px; font-weight: 800; color:#77D6C8; }
+.hero h1 { font-size: 44px; margin: 8px 0 6px; }
+.hero p { font-size: 17px; color:#AFC1CB; max-width: 850px; }
+.badge { display:inline-block; padding:6px 10px; border-radius:20px; background:#14322f; color:#86E3D2; font-size:12px; font-weight:700; }
+.kpi { background:#0d1b24; border:1px solid #223541; border-radius:15px; padding:18px; min-height:112px; }
+.kpi-label { color:#8EA3AE; font-size:12px; text-transform:uppercase; letter-spacing:1.2px; }
+.kpi-value { font-size:29px; font-weight:800; margin-top:6px; }
+.kpi-sub { color:#718792; font-size:12px; margin-top:4px; }
+.card { background:#0d1b24; border:1px solid #223541; border-radius:15px; padding:20px; }
+.section-kicker { color:#65CFC0; text-transform:uppercase; letter-spacing:2px; font-size:11px; font-weight:800; margin-top:10px; }
+.section-title { margin-top:3px; }
+.alert { border-left:4px solid #65CFC0; background:#0d2026; padding:14px 16px; border-radius:8px; }
+.warn { border-left-color:#E7B85B; background:#251f11; }
+.small { color:#8EA3AE; font-size:13px; }
+.reco { font-size:20px; font-weight:800; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Sidebar ----------
+st.sidebar.markdown("## FIELDWISE AI")
+st.sidebar.caption("V3 • Mature Field Decision Support")
+page = st.sidebar.radio(
+    "Navigation",
+    ["Command Center","Well Intelligence","Intervention Lab","Field Analytics","Explainable AI","Methodology"]
+)
+st.sidebar.divider()
+st.sidebar.caption("DEMO MODE")
+st.sidebar.write("Synthetic field dataset")
+st.sidebar.caption("All numerical results are illustrative and must be validated before operational use.")
+
+# ---------- Header ----------
+st.markdown("""
+<div class="hero">
+ <div class="brand">FIELDWISE AI · V3</div>
+ <span class="badge">MATURE FIELD INTELLIGENCE</span>
+ <h1>From Field History to Future Recovery.</h1>
+ <p>AI-assisted production intelligence that learns from historical field behaviour,
+ rapidly evaluates operating scenarios, and prioritises wells for engineering attention.</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ---------- Command Center ----------
+if page == "Command Center":
+    section("Field Command Center","EXECUTIVE VIEW")
+    active = latest["Well"].nunique()
+    oil = latest["Oil_Rate"].sum()
+    wc = np.average(latest["Water_Cut"], weights=latest["Oil_Rate"])
+    high = (latest.Priority.isin(["HIGH","CRITICAL"])).sum()
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Active Wells", f"{df['Well_ID'].nunique()}")
-    c2.metric("Current Oil", f"{total_oil:,.0f} BOPD")
-    c3.metric("Average Water Cut", f"{avg_wc*100:.1f}%")
-    c4.metric("High-Priority Wells", f"{high}")
+    with c1: kpi_card("Active wells", active, "Demo field")
+    with c2: kpi_card("Current oil", f"{oil:,.0f}", "field units / day")
+    with c3: kpi_card("Weighted water cut", f"{wc:.1f}%", "production weighted")
+    with c4: kpi_card("High-priority wells", high, "AI screening queue")
 
-    monthly = df.groupby("Date", as_index=False).agg(
-        Oil=("Oil_Rate","sum"),
-        Water=("Water_Rate","sum")
-    )
-    monthly["Water_Cut"] = monthly["Water"]/(monthly["Water"]+monthly["Oil"])
-
-    left,right = st.columns(2)
+    left,right = st.columns([1.4,1])
     with left:
-        fig = px.area(monthly, x="Date", y="Oil", title="Field Oil Production")
-        fig.update_layout(height=340, margin=dict(l=10,r=10,t=50,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        section("Field production trend","PERFORMANCE")
+        trend = df.groupby("Date")[["Oil_Rate","Water_Rate"]].sum().reset_index()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=trend.Date,y=trend.Oil_Rate,name="Oil rate",mode="lines"))
+        fig.add_trace(go.Scatter(x=trend.Date,y=trend.Water_Rate,name="Water rate",mode="lines"))
+        fig.update_layout(template="plotly_dark",height=330,margin=dict(l=10,r=10,t=10,b=10))
+        st.plotly_chart(fig,use_container_width=True)
     with right:
-        fig = px.line(monthly, x="Date", y="Water_Cut", title="Field Water-Cut Trend")
-        fig.update_yaxes(tickformat=".0%")
-        fig.update_layout(height=340, margin=dict(l=10,r=10,t=50,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        section("AI opportunity queue","PRIORITISATION")
+        q = latest.sort_values(["Priority","Water_Cut"], ascending=[True,False])
+        order = {"CRITICAL":0,"HIGH":1,"WATCH":2,"STABLE":3}
+        q["rank"] = q.Priority.map(order)
+        q=q.sort_values(["rank","Water_Cut"],ascending=[True,False]).head(7)
+        st.dataframe(q[["Well","Oil_Rate","Water_Cut","Priority"]].rename(columns={
+            "Oil_Rate":"Oil","Water_Cut":"Water cut"
+        }), hide_index=True, use_container_width=True)
 
-    st.markdown("### AI Opportunity Queue")
-    records = []
-    for well in df["Well_ID"].unique():
-        w, latest, decline = well_stats(well)
-        p,_ = priority_for(well)
-        records.append([
-            well, p, latest["Oil_Rate"], latest["Water_Cut"]*100,
-            decline, latest["Injection_Rate"]
-        ])
-    q = pd.DataFrame(records, columns=[
-        "Well","Priority","Oil (BOPD)","Water Cut (%)",
-        "Recent Oil Change (%)","Injection (bbl/day)"
-    ])
-    order = {"HIGH":0,"MEDIUM":1,"LOW":2}
-    q["_o"] = q["Priority"].map(order)
-    q = q.sort_values(["_o","Water Cut (%)"], ascending=[True,False]).drop(columns="_o")
-    st.dataframe(q.head(10), use_container_width=True, hide_index=True)
+    section("Water-cut evolution","PRODUCTION QUALITY")
+    wtrend = df.groupby("Date").apply(
+        lambda x: x.Water_Rate.sum()/(x.Water_Rate.sum()+x.Oil_Rate.sum())*100
+    ).reset_index(name="Water_Cut")
+    fig=px.line(wtrend,x="Date",y="Water_Cut")
+    fig.update_layout(template="plotly_dark",height=300,margin=dict(l=10,r=10,t=10,b=10))
+    st.plotly_chart(fig,use_container_width=True)
 
-    st.info(
-        "Decision workflow: identify the wells requiring attention → inspect drivers → "
-        "screen operating scenarios → present a recommendation for engineer review."
-    )
-
-# =========================================================
-# WELL INTELLIGENCE
-# =========================================================
+# ---------- Well Intelligence ----------
 elif page == "Well Intelligence":
-    st.markdown("## 🧠 AI Well Intelligence")
-    st.caption("Move from field-level trends to a well-level engineering view.")
-
-    well = st.selectbox("Select well", sorted(df["Well_ID"].unique()))
-    w, latest, decline = well_stats(well)
-    priority,_ = priority_for(well)
+    section("Well Intelligence","WELL-LEVEL DIAGNOSTICS")
+    well = st.selectbox("Select well", latest.Well.tolist())
+    hist = df[df.Well==well].copy()
+    row = latest[latest.Well==well].iloc[0]
+    recent = hist.tail(30)
+    oil_change = (recent.Oil_Rate.iloc[-1]/recent.Oil_Rate.iloc[0]-1)*100
+    wc = row.Water_Cut
 
     c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Oil Rate", f"{latest['Oil_Rate']:.0f} BOPD")
-    c2.metric("Water Rate", f"{latest['Water_Rate']:.0f} BWPD")
-    c3.metric("Water Cut", f"{latest['Water_Cut']*100:.1f}%")
-    c4.metric("BHP", f"{latest['Bottomhole_Pressure']:.0f} psi")
-    c5.metric("Recent Oil Change", f"{decline:.1f}%")
+    with c1:kpi_card("Oil rate",f"{row.Oil_Rate:.1f}","current")
+    with c2:kpi_card("Water rate",f"{row.Water_Rate:.1f}","current")
+    with c3:kpi_card("Water cut",f"{wc:.1f}%","current")
+    with c4:kpi_card("BHP",f"{row.Bottomhole_Pressure:.1f}","demo pressure units")
+    with c5:kpi_card("Priority",row.Priority,"AI screening")
 
-    if priority == "HIGH":
-        st.markdown(
-            '<div class="alert"><b>🔴 HIGH PRIORITY</b><br>'
-            'Prototype screening suggests this well deserves engineering review.</div>',
-            unsafe_allow_html=True
-        )
-    elif priority == "MEDIUM":
-        st.warning("🟠 MEDIUM PRIORITY — review the well trend and operating context.")
-    else:
-        st.markdown(
-            '<div class="good"><b>🟢 LOW PRIORITY</b><br>'
-            'No strong warning signal from the prototype indicators.</div>',
-            unsafe_allow_html=True
-        )
-
-    a,b = st.columns(2)
+    a,b=st.columns(2)
     with a:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=w["Date"], y=w["Oil_Rate"], mode="lines+markers", name="Oil"))
-        fig.update_layout(title="Oil Production History", yaxis_title="BOPD", xaxis_title="")
-        st.plotly_chart(fig, use_container_width=True)
+        fig=px.line(hist,x="Date",y="Oil_Rate",title="Oil production history")
+        fig.update_layout(template="plotly_dark",height=320)
+        st.plotly_chart(fig,use_container_width=True)
     with b:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=w["Date"], y=w["Water_Cut"], mode="lines+markers", name="Water Cut"))
-        fig.update_layout(title="Water-Cut History", yaxis_title="Water Cut", xaxis_title="")
-        fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
+        hist["Water_Cut"]=hist.Water_Rate/(hist.Water_Rate+hist.Oil_Rate)*100
+        fig=px.line(hist,x="Date",y="Water_Cut",title="Water-cut history")
+        fig.update_layout(template="plotly_dark",height=320)
+        st.plotly_chart(fig,use_container_width=True)
 
-    st.markdown("### 🔍 AI Driver Assessment")
-    drivers = {
-        "Production decline": max(0, min(100, -decline*3)),
-        "Water contribution": max(0, min(100, latest["Water_Cut"]*100)),
-        "Pressure condition": max(0, min(100, (1800-latest["Bottomhole_Pressure"])/8)),
-    }
-    for name,val in drivers.items():
-        st.write(f"**{name}** — {val:.0f}/100")
-        st.progress(int(val))
-
+    section("AI diagnosis","ENGINEERING SCREEN")
     reasons=[]
-    if decline < -8:
-        reasons.append("Recent oil production is declining.")
-    if latest["Water_Cut"] > .70:
-        reasons.append("Water cut is high.")
-    elif latest["Water_Cut"] > .60:
-        reasons.append("Water cut is elevated.")
-    if not reasons:
-        reasons.append("No major prototype warning indicator was detected.")
+    if oil_change < -5: reasons.append("Recent oil-rate decline is visible.")
+    if wc > 35: reasons.append("Water cut is elevated and may limit economic oil production.")
+    if row.Bottomhole_Pressure < 180: reasons.append("Current BHP is relatively low within the demonstration field.")
+    if not reasons: reasons.append("No major screening trigger detected; continue monitoring.")
+    st.markdown('<div class="alert">' + "<br>".join("• "+r for r in reasons) + "</div>", unsafe_allow_html=True)
+    note = ("Prioritise a controlled scenario review." if row.Priority in ["HIGH","CRITICAL"]
+            else "Continue surveillance and compare against nearby wells.")
+    st.markdown(f"**AI engineering note:** {note} This is a decision-support prototype, not an autonomous operating instruction.")
 
-    st.markdown("### AI-generated engineering note")
-    st.write(" • " + "\n • ".join(reasons))
-
-    st.caption(
-        "This is screening support, not a replacement for reservoir/production engineering judgement."
-    )
-
-# =========================================================
-# SCENARIO LAB
-# =========================================================
-elif page == "Scenario Lab":
-    st.markdown("## 🎛️ Scenario Lab")
-    st.caption("Rapidly screen alternative injection conditions with the trained proxy model.")
-
-    well = st.selectbox("Select well", sorted(df["Well_ID"].unique()), key="scenario")
-    w, latest, decline = well_stats(well)
-
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Current Injection", f"{latest['Injection_Rate']:.0f} bbl/day")
-    c2.metric("Current Oil", f"{latest['Oil_Rate']:.0f} BOPD")
-    c3.metric("Current Water Cut", f"{latest['Water_Cut']*100:.1f}%")
-
-    inj = st.slider(
-        "Proposed Injection Rate",
-        450, 1100,
-        int(round(latest["Injection_Rate"])),
-        10
-    )
-
-    run = st.button("▶ RUN AI SCENARIO", type="primary", use_container_width=True)
+# ---------- Intervention Lab ----------
+elif page == "Intervention Lab":
+    section("Intervention Lab","SCENARIO-BASED OPTIMISATION")
+    st.markdown("Test a proposed injection strategy against the current operating point. **Prototype responses are synthetic and illustrative.**")
+    well=st.selectbox("Well for scenario", latest.Well.tolist())
+    row=latest[latest.Well==well].iloc[0]
+    current=row.Injection_Rate
+    proposed=st.slider("Proposed injection rate",0.0,120.0,float(np.clip(current,0,120)),1.0)
+    run=st.button("RUN AI SCENARIO", type="primary", use_container_width=True)
 
     if run:
-        table = scenario_table(well)
-        chosen = table.iloc[(table["Injection_Rate"]-inj).abs().argsort()[:1]].iloc[0]
-        best = table.loc[table["Predicted_Oil"].idxmax()]
+        base=np.array([[row[f] for f in features]])
+        base_pred=float(model.predict(base)[0])
+        scenarios=np.linspace(0,120,31)
+        X=np.repeat(base,31,axis=0)
+        X[:,features.index("Injection_Rate")]=scenarios
+        oil_preds=model.predict(X)
+        # Conservative demo-only water response heuristic
+        water_preds=np.maximum(2,row.Water_Rate*(1+0.003*(scenarios-current)))
+        wc_preds=water_preds/(water_preds+oil_preds)*100
+        idx=int(np.argmin(np.where(wc_preds>55, 1e6, -oil_preds)))
+        best_inj=float(scenarios[idx])
+        pred_oil=float(model.predict([[row["Water_Rate"],row["Gas_Rate"],row["Wellhead_Pressure"],row["Bottomhole_Pressure"],proposed]])[0])
+        pred_water=float(np.maximum(2,row.Water_Rate*(1+0.003*(proposed-current))))
+        pred_wc=pred_water/(pred_water+pred_oil)*100
 
-        delta_oil = chosen["Predicted_Oil"]-latest["Oil_Rate"]
-        delta_wc = chosen["Estimated_Water_Cut"]-latest["Water_Cut"]
+        c1,c2,c3,c4=st.columns(4)
+        with c1:kpi_card("Predicted oil",f"{pred_oil:.1f}","proxy-model estimate")
+        with c2:kpi_card("Estimated water",f"{pred_water:.1f}","demo response")
+        with c3:kpi_card("Estimated water cut",f"{pred_wc:.1f}%","demo response")
+        with c4:kpi_card("Suggested injection",f"{best_inj:.0f}","screening optimum")
 
-        st.divider()
-        st.markdown("### Scenario Outcome")
+        fig=go.Figure()
+        fig.add_trace(go.Scatter(x=scenarios,y=oil_preds,name="Predicted oil",mode="lines"))
+        fig.add_vline(x=proposed,line_dash="dash",annotation_text="Proposed")
+        fig.add_vline(x=best_inj,line_dash="dot",annotation_text="Screening optimum")
+        fig.update_layout(template="plotly_dark",height=360,xaxis_title="Injection rate",yaxis_title="Predicted oil rate")
+        st.plotly_chart(fig,use_container_width=True)
 
-        x1,x2,x3 = st.columns(3)
-        x1.metric("Predicted Oil", f"{chosen['Predicted_Oil']:.0f} BOPD", f"{delta_oil:+.0f}")
-        x2.metric("Estimated Water", f"{chosen['Estimated_Water']:.0f} BWPD")
-        x3.metric("Estimated Water Cut", f"{chosen['Estimated_Water_Cut']*100:.1f}%", f"{delta_wc*100:+.1f} pp")
-
-        fig = px.line(
-            table, x="Injection_Rate", y="Predicted_Oil",
-            markers=True, title="Proxy Response Curve"
-        )
-        fig.add_vline(x=inj, line_dash="dash")
-        fig.add_vline(x=float(best["Injection_Rate"]), line_dash="dot")
-        fig.update_layout(
-            xaxis_title="Injection Rate (bbl/day)",
-            yaxis_title="Predicted Oil (BOPD)"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        if delta_oil > 0 and chosen["Estimated_Water_Cut"] <= latest["Water_Cut"]:
-            tone = "good"
-            text = (
-                f"The tested scenario shows a potentially favourable response. "
-                f"Within the screened range, the highest predicted oil response occurs "
-                f"near **{best['Injection_Rate']:.0f} bbl/day**."
-            )
-        elif delta_oil > 0:
-            tone = "alert"
-            text = (
-                f"Oil response improves in the tested scenario, but estimated water contribution "
-                f"also rises. The result should be reviewed against field constraints."
-            )
+        delta=pred_oil-base_pred
+        if proposed > best_inj+5:
+            recommendation="Reduce the proposed injection and review a moderate operating point."
+        elif proposed < best_inj-5:
+            recommendation="A controlled injection increase may be worth evaluating."
         else:
-            tone = "alert"
-            text = (
-                "The tested condition does not improve predicted oil response. "
-                "Review alternative operating conditions."
-            )
+            recommendation="The proposed rate is close to the model's screening optimum."
 
-        st.markdown(f'<div class="{tone}"><b>💡 AI Recommendation</b><br>{text}</div>',
-                    unsafe_allow_html=True)
+        st.markdown(f'<div class="alert"><div class="reco">AI recommendation</div>{recommendation}<br><span class="small">Modelled oil change versus current proxy estimate: {delta:+.1f}. Validate against reservoir constraints, well integrity, facilities and engineering judgement before any field action.</span></div>', unsafe_allow_html=True)
 
-        st.caption(
-            "Prototype only: numerical scenario outputs are generated from synthetic demonstration "
-            "data and a prototype model. They are not field-operating recommendations."
-        )
+        st.markdown("### Current vs proposed")
+        comp=pd.DataFrame({
+            "Metric":["Injection","Oil rate","Water rate","Water cut"],
+            "Current":[current,row.Oil_Rate,row.Water_Rate,row.Water_Cut],
+            "Proposed":[proposed,pred_oil,pred_water,pred_wc]
+        })
+        st.dataframe(comp,hide_index=True,use_container_width=True)
 
-    st.divider()
-    st.markdown("### Model validation")
-    st.write(f"Held-out demonstration-period MAE: **{mae:.1f} BOPD**")
-    st.caption(
-        "Real deployment would require validated field data, uncertainty analysis, "
-        "engineering constraints and independent field validation."
-    )
+    else:
+        st.info("Choose a well and proposed injection rate, then run the scenario.")
 
-# =========================================================
-# FIELD ANALYTICS
-# =========================================================
+# ---------- Field Analytics ----------
 elif page == "Field Analytics":
-    st.markdown("## 📊 Field Analytics")
-    st.caption("Use historical behaviour to understand where production potential may be changing.")
+    section("Field Analytics","PATTERN DISCOVERY")
+    metric=st.selectbox("Visualise metric",["Oil_Rate","Water_Cut","Injection_Rate","Bottomhole_Pressure"])
+    if metric=="Water_Cut":
+        plot=latest.copy()
+        y="Water_Cut"
+        title="Current water-cut by well"
+    else:
+        plot=latest.copy()
+        y=metric
+        title=f"Current {metric.replace('_',' ')} by well"
+    fig=px.scatter(plot,x="Well",y=y,size="Oil_Rate",color="Priority",hover_data=["Oil_Rate","Water_Cut","Injection_Rate"])
+    fig.update_layout(template="plotly_dark",height=390)
+    st.plotly_chart(fig,use_container_width=True)
 
-    metric = st.selectbox(
-        "Field metric",
-        ["Oil Rate", "Water Cut", "Injection Rate", "Bottomhole Pressure"]
-    )
+    section("Well opportunity map","FIELD VIEW")
+    rng=np.random.default_rng(8)
+    mapdf=latest.copy()
+    mapdf["X"]=rng.uniform(0,100,len(mapdf))
+    mapdf["Y"]=rng.uniform(0,60,len(mapdf))
+    fig=px.scatter(mapdf,x="X",y="Y",text="Well",color="Priority",size="Oil_Rate",
+                   hover_data=["Oil_Rate","Water_Cut","Injection_Rate"])
+    fig.update_traces(textposition="top center")
+    fig.update_layout(template="plotly_dark",height=450,xaxis_title="Field coordinate X (demo)",
+                      yaxis_title="Field coordinate Y (demo)")
+    st.plotly_chart(fig,use_container_width=True)
+    st.caption("Well coordinates are synthetic for demonstration; this is a field-intelligence visualisation, not a geological model.")
 
-    agg = df.groupby("Date", as_index=False).agg(
-        Oil_Rate=("Oil_Rate","sum"),
-        Water_Rate=("Water_Rate","sum"),
-        Injection_Rate=("Injection_Rate","sum"),
-        Bottomhole_Pressure=("Bottomhole_Pressure","mean")
-    )
-    agg["Water_Cut"] = agg["Water_Rate"]/(agg["Water_Rate"]+agg["Oil_Rate"])
+# ---------- Explainable AI ----------
+elif page == "Explainable AI":
+    section("Explainable AI","WHY THE MODEL FLAGS A WELL")
+    well=st.selectbox("Select well",latest.Well.tolist())
+    row=latest[latest.Well==well].iloc[0]
+    importances=pd.Series(model.feature_importances_,index=features).sort_values(ascending=False)
+    imp_df=importances.reset_index()
+    imp_df.columns=["Feature","Importance"]
+    fig=px.bar(imp_df,x="Importance",y="Feature",orientation="h")
+    fig.update_layout(template="plotly_dark",height=350)
+    st.plotly_chart(fig,use_container_width=True)
 
-    col_map = {
-        "Oil Rate":"Oil_Rate",
-        "Water Cut":"Water_Cut",
-        "Injection Rate":"Injection_Rate",
-        "Bottomhole Pressure":"Bottomhole_Pressure"
-    }
-    y = col_map[metric]
-    fig = px.line(agg, x="Date", y=y, markers=True, title=f"Field {metric}")
-    if metric == "Water Cut":
-        fig.update_yaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
+    st.markdown('<div class="card"><b>How to read this</b><br>The chart shows global Random Forest feature importance for the demonstration model. It indicates which input variables were most useful to the model overall; it does not prove physical causality for an individual well.</div>',unsafe_allow_html=True)
+    vals=pd.DataFrame({
+        "Input":["Water rate","Gas rate","Wellhead pressure","Bottomhole pressure","Injection rate"],
+        "Current":[row.Water_Rate,row.Gas_Rate,row.Wellhead_Pressure,row.Bottomhole_Pressure,row.Injection_Rate]
+    })
+    st.dataframe(vals,hide_index=True,use_container_width=True)
 
-    st.markdown("### Well opportunity map")
-    latest = latest_snapshot()
-    latest["Priority"] = latest["Well_ID"].map(lambda x: priority_for(x)[0])
-    latest["Oil_per_1000_BWPD"] = latest["Oil_Rate"]/(latest["Water_Rate"]/1000)
+    section("Validation","HELD-OUT DATA")
+    st.metric("Test-set MAE",f"{mae:.2f}")
+    fig=px.scatter(test_df,x="Oil_Rate",y="Predicted_Oil",opacity=.55)
+    lo=min(test_df.Oil_Rate.min(),test_df.Predicted_Oil.min())
+    hi=max(test_df.Oil_Rate.max(),test_df.Predicted_Oil.max())
+    fig.add_shape(type="line",x0=lo,y0=lo,x1=hi,y1=hi)
+    fig.update_layout(template="plotly_dark",height=380,xaxis_title="Actual oil rate",yaxis_title="Predicted oil rate")
+    st.plotly_chart(fig,use_container_width=True)
 
-    fig = px.scatter(
-        latest,
-        x="Water_Cut", y="Oil_Rate",
-        size="Injection_Rate",
-        hover_name="Well_ID",
-        text="Well_ID",
-        symbol="Priority",
-        title="Current Well Positioning: Oil Rate vs Water Cut",
-        labels={"Water_Cut":"Water Cut","Oil_Rate":"Oil Rate (BOPD)"}
-    )
-    fig.update_xaxes(tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.info(
-        "Interpretation: wells with lower oil performance and higher water contribution "
-        "may warrant closer engineering review. This screening view does not diagnose "
-        "the underlying reservoir mechanism."
-    )
-
-# =========================================================
-# METHODOLOGY
-# =========================================================
-else:
-    st.markdown("## 🧩 How FIELDWISE AI Works")
-    st.caption("The prototype follows the proposed data-to-decision workflow.")
-
-    stages = [
-        ("01", "Historical Field Data", "Oil, water, gas, pressure and injection observations."),
-        ("02", "Data Processing", "Prepare noisy/missing operational data for modelling."),
-        ("03", "ML Proxy Model", "Learn relationships between operating conditions and oil response."),
-        ("04", "Well Intelligence", "Screen wells for decline and elevated water contribution."),
-        ("05", "Scenario Lab", "Rapidly evaluate alternative operating/injection conditions."),
-        ("06", "Optimisation", "Compare predicted outcomes within the screened scenario space."),
-        ("07", "Engineer Decision Support", "Present interpretable outputs for engineering review."),
+# ---------- Methodology ----------
+elif page == "Methodology":
+    section("How FIELDWISE AI Works","TECHNICAL ARCHITECTURE")
+    steps=[
+        ("01","Historical field data","Production, pressure and injection history form the learning base."),
+        ("02","Data quality","Clean, align and prepare time-series observations."),
+        ("03","ML proxy model","A Random Forest model learns relationships between operating variables and oil rate."),
+        ("04","Well intelligence","Screen wells for decline, water-cut and pressure-related attention."),
+        ("05","Scenario engine","Rapidly evaluate alternative injection settings."),
+        ("06","Optimisation","Rank scenarios using production response with a water-cut constraint in the demo."),
+        ("07","Engineer recommendation","Present the result as decision support—not an autonomous command.")
     ]
+    for n,t,d in steps:
+        st.markdown(f'<div class="card" style="margin-bottom:10px"><b>{n} · {t}</b><br><span class="small">{d}</span></div>',unsafe_allow_html=True)
 
-    for num,title,desc in stages:
-        st.markdown(f"### {num} — {title}")
-        st.write(desc)
-        if num != "07":
-            st.markdown("↓")
-
-    st.divider()
-    st.markdown("### Technology Stack")
-    st.code("""
-Data                  → CSV / field-history format
-Processing            → Python + Pandas
-ML Proxy               → Scikit-Learn / Random Forest prototype
-Visual Analytics      → Plotly
-Application            → Streamlit
-Deployment target      → Streamlit-compatible hosting
-""")
-
-    st.markdown("### What is innovative here?")
-    st.write(
-        "The prototype connects four activities in one decision-support workflow: "
-        "historical field behaviour, well-level diagnostics, rapid scenario prediction "
-        "and optimisation-oriented recommendations."
-    )
-
-    st.warning(
-        "Prototype limitation: the current dataset is synthetic. The model is a demonstration "
-        "of the proposed workflow, not a validated reservoir model. A production implementation "
-        "must be calibrated and validated with appropriate field data and engineering constraints."
-    )
-
-st.divider()
-st.caption(
-    "FIELDWISE AI V2 • AI decision-support prototype for mature oil fields • "
-    "Synthetic demonstration data"
-)
+    section("Technology stack","IMPLEMENTATION")
+    st.code("Python  •  Pandas  •  Scikit-learn  •  Plotly  •  Streamlit",language="text")
+    section("Model validation","CREDIBILITY")
+    st.write(f"Chronological held-out test evaluation is used. Demonstration test-set MAE: **{mae:.2f} oil-rate units**.")
+    st.warning("All field values, well coordinates and scenario-response assumptions in this prototype are synthetic. Before operational deployment, the workflow requires validated field data, proper time-series validation, uncertainty analysis, reservoir/production constraints, facility constraints and engineering review.")
+    section("Innovation statement","WHY THIS IS DIFFERENT")
+    st.markdown("""
+    <div class="alert">
+    <b>FIELDWISE AI is not positioned as a replacement for a physics-based reservoir simulator.</b><br><br>
+    It is a decision-support layer that learns from mature-field history, screens well-level opportunities,
+    rapidly evaluates operating scenarios and communicates recommendations in an engineer-friendly interface.
+    </div>
+    """,unsafe_allow_html=True)
