@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,6 +5,8 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 import plotly.express as px
 import plotly.graph_objects as go
+import base64
+import os
 
 st.set_page_config(page_title="FIELDWISE AI V3", page_icon="⛽", layout="wide")
 
@@ -66,46 +67,62 @@ def priority(row):
 latest["Priority"] = latest.apply(priority, axis=1)
 
 def kpi_card(label, value, sub=""):
-    st.markdown(f"""
+    st.markdown(f'''
     <div class="kpi">
       <div class="kpi-label">{label}</div>
       <div class="kpi-value">{value}</div>
       <div class="kpi-sub">{sub}</div>
     </div>
-    """, unsafe_allow_html=True)
+    ''', unsafe_allow_html=True)
 
 def section(title, kicker=""):
     st.markdown(f'<div class="section-kicker">{kicker}</div><h2 class="section-title">{title}</h2>', unsafe_allow_html=True)
 
-# ---------- Styling ----------
-st.markdown("""
+# ---------- Background Image & Styling ----------
+# Convert local image to base64 so Streamlit can render it in CSS
+bg_img_path = "Gemini_Generated_Image_nh5w0bnh5w0bnh5w.jpg"
+if os.path.exists(bg_img_path):
+    with open(bg_img_path, "rb") as img_file:
+        encoded_string = base64.b64encode(img_file.read()).decode()
+    bg_url = f"data:image/jpeg;base64,{encoded_string}"
+else:
+    bg_url = "" # Fallback if file isn't found
+
+st.markdown(f'''
 <style>
-.stApp { background: #071018; color: #EAF2F7; }
-.block-container { padding-top: 1.2rem; max-width: 1450px; }
-.hero {
-  padding: 34px 38px; border: 1px solid #233541; border-radius: 20px;
-  background: linear-gradient(135deg,#0c1d28,#0a141b);
+/* App background with dark gradient overlay for readability */
+.stApp {{
+    background: linear-gradient(rgba(7, 16, 24, 0.85), rgba(7, 16, 24, 0.95)), url("{bg_url}") no-repeat center center fixed;
+    background-size: cover;
+    color: #EAF2F7;
+}}
+.block-container {{ padding-top: 1.2rem; max-width: 1450px; }}
+.hero {{
+  padding: 34px 38px; border: 1px solid rgba(35, 53, 65, 0.6); border-radius: 20px;
+  background: linear-gradient(135deg, rgba(12, 29, 40, 0.8), rgba(10, 20, 27, 0.8));
+  backdrop-filter: blur(10px);
   margin-bottom: 22px;
-}
-.brand { font-size: 14px; letter-spacing: 4px; font-weight: 800; color:#77D6C8; }
-.hero h1 { font-size: 44px; margin: 8px 0 6px; }
-.hero p { font-size: 17px; color:#AFC1CB; max-width: 850px; }
-.badge { display:inline-block; padding:6px 10px; border-radius:20px; background:#14322f; color:#86E3D2; font-size:12px; font-weight:700; }
-.kpi { background:#0d1b24; border:1px solid #223541; border-radius:15px; padding:18px; min-height:112px; }
-.kpi-label { color:#8EA3AE; font-size:12px; text-transform:uppercase; letter-spacing:1.2px; }
-.kpi-value { font-size:29px; font-weight:800; margin-top:6px; }
-.kpi-sub { color:#718792; font-size:12px; margin-top:4px; }
-.card { background:#0d1b24; border:1px solid #223541; border-radius:15px; padding:20px; }
-.section-kicker { color:#65CFC0; text-transform:uppercase; letter-spacing:2px; font-size:11px; font-weight:800; margin-top:10px; }
-.section-title { margin-top:3px; }
-.alert { border-left:4px solid #65CFC0; background:#0d2026; padding:14px 16px; border-radius:8px; }
-.warn { border-left-color:#E7B85B; background:#251f11; }
-.small { color:#8EA3AE; font-size:13px; }
-.reco { font-size:20px; font-weight:800; }
+}}
+.brand {{ font-size: 14px; letter-spacing: 4px; font-weight: 800; color:#77D6C8; }}
+.hero h1 {{ font-size: 44px; margin: 8px 0 6px; }}
+.hero p {{ font-size: 17px; color:#AFC1CB; max-width: 850px; }}
+.badge {{ display:inline-block; padding:6px 10px; border-radius:20px; background:#14322f; color:#86E3D2; font-size:12px; font-weight:700; }}
+.kpi {{ background: rgba(13, 27, 36, 0.7); backdrop-filter: blur(5px); border:1px solid #223541; border-radius:15px; padding:18px; min-height:112px; }}
+.kpi-label {{ color:#8EA3AE; font-size:12px; text-transform:uppercase; letter-spacing:1.2px; }}
+.kpi-value {{ font-size:29px; font-weight:800; margin-top:6px; }}
+.kpi-sub {{ color:#718792; font-size:12px; margin-top:4px; }}
+.card {{ background: rgba(13, 27, 36, 0.7); backdrop-filter: blur(5px); border:1px solid #223541; border-radius:15px; padding:20px; }}
+.section-kicker {{ color:#65CFC0; text-transform:uppercase; letter-spacing:2px; font-size:11px; font-weight:800; margin-top:10px; }}
+.section-title {{ margin-top:3px; }}
+.alert {{ border-left:4px solid #65CFC0; background:rgba(13, 32, 38, 0.85); backdrop-filter: blur(5px); padding:14px 16px; border-radius:8px; }}
+.warn {{ border-left-color:#E7B85B; background:rgba(37, 31, 17, 0.85); }}
+.small {{ color:#8EA3AE; font-size:13px; }}
+.reco {{ font-size:20px; font-weight:800; }}
 </style>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
 # ---------- Sidebar ----------
+st.sidebar.image("Gemini_Generated_Image_nh5w0bnh5w0bnh5w.jpg", use_container_width=True)
 st.sidebar.markdown("## FIELDWISE AI")
 st.sidebar.caption("V3 • Mature Field Decision Support")
 page = st.sidebar.radio(
@@ -118,7 +135,7 @@ st.sidebar.write("Synthetic field dataset")
 st.sidebar.caption("All numerical results are illustrative and must be validated before operational use.")
 
 # ---------- Header ----------
-st.markdown("""
+st.markdown('''
 <div class="hero">
  <div class="brand">FIELDWISE AI · V3</div>
  <span class="badge">MATURE FIELD INTELLIGENCE</span>
@@ -126,7 +143,7 @@ st.markdown("""
  <p>AI-assisted production intelligence that learns from historical field behaviour,
  rapidly evaluates operating scenarios, and prioritises wells for engineering attention.</p>
 </div>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
 # ---------- Command Center ----------
 if page == "Command Center":
@@ -148,7 +165,7 @@ if page == "Command Center":
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=trend.Date,y=trend.Oil_Rate,name="Oil rate",mode="lines"))
         fig.add_trace(go.Scatter(x=trend.Date,y=trend.Water_Rate,name="Water rate",mode="lines"))
-        fig.update_layout(template="plotly_dark",height=330,margin=dict(l=10,r=10,t=10,b=10))
+        fig.update_layout(template="plotly_dark",height=330,margin=dict(l=10,r=10,t=10,b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig,use_container_width=True)
     with right:
         section("AI opportunity queue","PRIORITISATION")
@@ -165,7 +182,7 @@ if page == "Command Center":
         lambda x: x.Water_Rate.sum()/(x.Water_Rate.sum()+x.Oil_Rate.sum())*100
     ).reset_index(name="Water_Cut")
     fig=px.line(wtrend,x="Date",y="Water_Cut")
-    fig.update_layout(template="plotly_dark",height=300,margin=dict(l=10,r=10,t=10,b=10))
+    fig.update_layout(template="plotly_dark",height=300,margin=dict(l=10,r=10,t=10,b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig,use_container_width=True)
 
 # ---------- Well Intelligence ----------
@@ -188,12 +205,12 @@ elif page == "Well Intelligence":
     a,b=st.columns(2)
     with a:
         fig=px.line(hist,x="Date",y="Oil_Rate",title="Oil production history")
-        fig.update_layout(template="plotly_dark",height=320)
+        fig.update_layout(template="plotly_dark",height=320, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig,use_container_width=True)
     with b:
         hist["Water_Cut"]=hist.Water_Rate/(hist.Water_Rate+hist.Oil_Rate)*100
         fig=px.line(hist,x="Date",y="Water_Cut",title="Water-cut history")
-        fig.update_layout(template="plotly_dark",height=320)
+        fig.update_layout(template="plotly_dark",height=320, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig,use_container_width=True)
 
     section("AI diagnosis","ENGINEERING SCREEN")
@@ -224,7 +241,6 @@ elif page == "Intervention Lab":
         X=np.repeat(base,31,axis=0)
         X[:,features.index("Injection_Rate")]=scenarios
         oil_preds=model.predict(X)
-        # Conservative demo-only water response heuristic
         water_preds=np.maximum(2,row.Water_Rate*(1+0.003*(scenarios-current)))
         wc_preds=water_preds/(water_preds+oil_preds)*100
         idx=int(np.argmin(np.where(wc_preds>55, 1e6, -oil_preds)))
@@ -243,7 +259,7 @@ elif page == "Intervention Lab":
         fig.add_trace(go.Scatter(x=scenarios,y=oil_preds,name="Predicted oil",mode="lines"))
         fig.add_vline(x=proposed,line_dash="dash",annotation_text="Proposed")
         fig.add_vline(x=best_inj,line_dash="dot",annotation_text="Screening optimum")
-        fig.update_layout(template="plotly_dark",height=360,xaxis_title="Injection rate",yaxis_title="Predicted oil rate")
+        fig.update_layout(template="plotly_dark",height=360,xaxis_title="Injection rate",yaxis_title="Predicted oil rate", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig,use_container_width=True)
 
         delta=pred_oil-base_pred
@@ -280,7 +296,7 @@ elif page == "Field Analytics":
         y=metric
         title=f"Current {metric.replace('_',' ')} by well"
     fig=px.scatter(plot,x="Well",y=y,size="Oil_Rate",color="Priority",hover_data=["Oil_Rate","Water_Cut","Injection_Rate"])
-    fig.update_layout(template="plotly_dark",height=390)
+    fig.update_layout(template="plotly_dark",height=390, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig,use_container_width=True)
 
     section("Well opportunity map","FIELD VIEW")
@@ -292,7 +308,7 @@ elif page == "Field Analytics":
                    hover_data=["Oil_Rate","Water_Cut","Injection_Rate"])
     fig.update_traces(textposition="top center")
     fig.update_layout(template="plotly_dark",height=450,xaxis_title="Field coordinate X (demo)",
-                      yaxis_title="Field coordinate Y (demo)")
+                      yaxis_title="Field coordinate Y (demo)", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig,use_container_width=True)
     st.caption("Well coordinates are synthetic for demonstration; this is a field-intelligence visualisation, not a geological model.")
 
@@ -305,7 +321,7 @@ elif page == "Explainable AI":
     imp_df=importances.reset_index()
     imp_df.columns=["Feature","Importance"]
     fig=px.bar(imp_df,x="Importance",y="Feature",orientation="h")
-    fig.update_layout(template="plotly_dark",height=350)
+    fig.update_layout(template="plotly_dark",height=350, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig,use_container_width=True)
 
     st.markdown('<div class="card"><b>How to read this</b><br>The chart shows global Random Forest feature importance for the demonstration model. It indicates which input variables were most useful to the model overall; it does not prove physical causality for an individual well.</div>',unsafe_allow_html=True)
@@ -321,7 +337,7 @@ elif page == "Explainable AI":
     lo=min(test_df.Oil_Rate.min(),test_df.Predicted_Oil.min())
     hi=max(test_df.Oil_Rate.max(),test_df.Predicted_Oil.max())
     fig.add_shape(type="line",x0=lo,y0=lo,x1=hi,y1=hi)
-    fig.update_layout(template="plotly_dark",height=380,xaxis_title="Actual oil rate",yaxis_title="Predicted oil rate")
+    fig.update_layout(template="plotly_dark",height=380,xaxis_title="Actual oil rate",yaxis_title="Predicted oil rate", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
     st.plotly_chart(fig,use_container_width=True)
 
 # ---------- Methodology ----------
@@ -345,10 +361,10 @@ elif page == "Methodology":
     st.write(f"Chronological held-out test evaluation is used. Demonstration test-set MAE: **{mae:.2f} oil-rate units**.")
     st.warning("All field values, well coordinates and scenario-response assumptions in this prototype are synthetic. Before operational deployment, the workflow requires validated field data, proper time-series validation, uncertainty analysis, reservoir/production constraints, facility constraints and engineering review.")
     section("Innovation statement","WHY THIS IS DIFFERENT")
-    st.markdown("""
+    st.markdown('''
     <div class="alert">
     <b>FIELDWISE AI is not positioned as a replacement for a physics-based reservoir simulator.</b><br><br>
     It is a decision-support layer that learns from mature-field history, screens well-level opportunities,
     rapidly evaluates operating scenarios and communicates recommendations in an engineer-friendly interface.
     </div>
-    """,unsafe_allow_html=True)
+    ''',unsafe_allow_html=True)
