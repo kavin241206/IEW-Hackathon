@@ -44,7 +44,9 @@ st.markdown("""
 # ==========================================
 @st.cache_data
 def generate_field_data():
-    dates = pd.date_range(start='2020-01-01', end='2026-10-01', freq='M')
+    # FIXED: Changed freq='M' to freq='ME' for Pandas 2.2+ compatibility
+    dates = pd.date_range(start='2020-01-01', end='2026-10-01', freq='ME')
+    
     # Simulate mature field decline (exponential decline)
     time = np.arange(len(dates))
     base_oil = 10000 * np.exp(-0.02 * time) + np.random.normal(0, 200, len(dates))
@@ -127,8 +129,8 @@ elif page == "🤖 AI Reservoir Modeling":
     st.title("AI Decline Curve Analysis (DCA) & Forecasting")
     st.markdown("Machine Learning predictions for remaining useful life and future production trends in mature zones.")
     
-    # Simulate ML Prediction Data
-    future_dates = pd.date_range(start='2026-10-01', end='2030-01-01', freq='M')
+    # FIXED: Changed freq='M' to freq='ME'
+    future_dates = pd.date_range(start='2026-10-01', end='2030-01-01', freq='ME')
     time = np.arange(len(df_historical), len(df_historical) + len(future_dates))
     
     # Standard decline vs ML optimized decline
@@ -165,12 +167,12 @@ elif page == "⚙️ Production Optimization":
     
     st.subheader("High-Priority Well Recommendations")
     
-    # Display the dataframe with stylized columns
+    # FIXED: Changed applymap() to map() for modern Pandas compatibility
     st.dataframe(
-        df_wells.style.applymap(
+        df_wells.style.map(
             lambda x: 'background-color: #ff4b4b; color: white' if x == 'Under-performing' or x == 'Shut-in' else 'background-color: #00E676; color: black' if x == 'Active' else '',
             subset=['Status']
-        ).applymap(
+        ).map(
             lambda x: 'color: #00b4d8; font-weight: bold' if isinstance(x, str) else '',
             subset=['AI ML Intervention']
         ),
