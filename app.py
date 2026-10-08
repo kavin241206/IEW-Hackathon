@@ -129,10 +129,6 @@ page = st.sidebar.radio(
     "Navigation",
     ["Command Center","Well Intelligence","Intervention Lab","Field Analytics","Explainable AI","Methodology"]
 )
-st.sidebar.divider()
-st.sidebar.caption("DEMO MODE")
-st.sidebar.write("Synthetic field dataset")
-st.sidebar.caption("All numerical results are illustrative and must be validated before operational use.")
 st.sidebar.markdown("<div style=\"margin-top:28px; padding-top:10px; border-top:1px solid #20323d; color:#6F858F; font-size:11px; letter-spacing:.5px; text-align:center;\">designed by Kavinkarthick</div>", unsafe_allow_html=True)
 
 # ---------- Header ----------
@@ -223,7 +219,6 @@ elif page == "Well Intelligence":
     st.markdown('<div class="alert">' + "<br>".join("• "+r for r in reasons) + "</div>", unsafe_allow_html=True)
     note = ("Prioritise a controlled scenario review." if row.Priority in ["HIGH","CRITICAL"]
             else "Continue surveillance and compare against nearby wells.")
-    st.markdown(f"**AI engineering note:** {note} This is a decision-support prototype, not an autonomous operating instruction.")
 
 # ---------- Intervention Lab ----------
 elif page == "Intervention Lab":
@@ -272,7 +267,6 @@ elif page == "Intervention Lab":
         else:
             recommendation="The proposed rate is close to the model's screening optimum."
 
-        st.markdown(f'<div class="alert"><div class="reco">AI recommendation</div>{recommendation}<br><span class="small">Modelled oil change versus current proxy estimate: {delta:+.1f}. Validate against reservoir constraints, well integrity, facilities and engineering judgement before any field action.</span></div>', unsafe_allow_html=True)
 
         st.markdown("### Current vs proposed")
         comp=pd.DataFrame({
@@ -359,7 +353,7 @@ elif page == "Methodology":
 
     section("Technology stack","IMPLEMENTATION")
     st.code("Python  •  Pandas  •  Scikit-learn  •  Plotly  •  Streamlit",language="text")
-    section("Model validation","CREDIBILITY")
+    section("Model validation")
     st.write(f"Chronological held-out test evaluation is used. Demonstration test-set MAE: **{mae:.2f} oil-rate units**.")
     st.warning("All field values, well coordinates and scenario-response assumptions in this prototype are synthetic. Before operational deployment, the workflow requires validated field data, proper time-series validation, uncertainty analysis, reservoir/production constraints, facility constraints and engineering review.")
     section("Innovation statement","WHY THIS IS DIFFERENT")
