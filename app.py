@@ -355,7 +355,6 @@ elif page == "Methodology":
     st.code("Python  •  Pandas  •  Scikit-learn  •  Plotly  •  Streamlit",language="text")
     section("Model validation")
     st.write(f"Chronological held-out test evaluation is used. Demonstration test-set MAE: **{mae:.2f} oil-rate units**.")
-    st.warning("All field values, well coordinates and scenario-response assumptions in this prototype are synthetic. Before operational deployment, the workflow requires validated field data, proper time-series validation, uncertainty analysis, reservoir/production constraints, facility constraints and engineering review.")
     section("Innovation statement","WHY THIS IS DIFFERENT")
     st.markdown("""
     <div class="alert">
