@@ -231,7 +231,9 @@ uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
 unit_choices = {}
 if uploaded_bytes:
     try:
-        _unit_raw = pd.read_csv(io.BytesIO(uploaded_bytes))
+        # Inspect only a small sample to build unit controls. Do NOT parse all 49.5 MB
+        # on every Streamlit rerun just to discover the column names.
+        _unit_raw = pd.read_csv(io.BytesIO(uploaded_bytes), nrows=1000, low_memory=False)
         _unit_frame, _unit_mapping, _unit_ignored = map_industrial_columns(_unit_raw)
         st.sidebar.markdown("### Input units → standard units")
         st.sidebar.caption("Choose the unit used in your uploaded file for each recognised field. Conversions happen before cleaning and modelling.")
@@ -243,12 +245,18 @@ if uploaded_bytes:
     except Exception as _unit_error:
         st.sidebar.warning(f"Could not inspect units yet: {_unit_error}")
 
-@st.cache_data
+@st.cache_data(show_spinner="Reading industrial CSV…", max_entries=2)
 def load_uploaded(file_bytes):
-    """Parse uploaded CSV bytes from a fresh stream on every call."""
+    """Parse the full uploaded CSV once and cache it; each call uses a fresh byte stream."""
     if not file_bytes:
         raise ValueError("The uploaded CSV is empty.")
-    return pd.read_csv(io.BytesIO(file_bytes))
+    try:
+        return pd.read_csv(io.BytesIO(file_bytes), low_memory=False, on_bad_lines="error")
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError("The uploaded file contains no readable CSV columns. Check that it is a non-empty CSV, not an Excel file renamed .csv.") from exc
+    except UnicodeDecodeError:
+        # Some industrial exports are saved as Windows-1252 rather than UTF-8.
+        return pd.read_csv(io.BytesIO(file_bytes), encoding="cp1252", low_memory=False, on_bad_lines="error")
 
 source = "Built-in illustrative dataset"
 upload_error = None
