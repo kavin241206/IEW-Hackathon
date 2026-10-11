@@ -50,40 +50,12 @@ def map_industrial_columns(raw):
     ignored = [str(c) for c in raw.columns if c not in mapped.values()]
     return df[selected].copy(), mapped, ignored
 
-UNIT_OPTIONS = {
-    "Oil_Rate": {"m³/d": (1.0, 0.0), "bbl/d": (0.1589872949, 0.0), "STB/d": (0.1589872949, 0.0), "m³/h": (24.0, 0.0), "L/s": (86.4, 0.0), "L/min": (1.44, 0.0), "ft³/d": (0.0283168466, 0.0)},
-    "Water_Rate": {"m³/d": (1.0, 0.0), "bbl/d": (0.1589872949, 0.0), "STB/d": (0.1589872949, 0.0), "m³/h": (24.0, 0.0), "L/s": (86.4, 0.0), "L/min": (1.44, 0.0), "ft³/d": (0.0283168466, 0.0)},
-    "Gas_Rate": {"Sm³/d": (1.0, 0.0), "Mscf/d": (28.3168466, 0.0), "scf/d": (0.0283168466, 0.0), "MMSCFD": (28316.8466, 0.0), "Nm³/h": (24.0, 0.0)},
-    "Injection_Rate": {"m³/d": (1.0, 0.0), "bbl/d": (0.1589872949, 0.0), "STB/d": (0.1589872949, 0.0), "m³/h": (24.0, 0.0), "L/s": (86.4, 0.0), "ft³/d": (0.0283168466, 0.0), "Sm³/d": (1.0, 0.0), "Mscf/d": (28.3168466, 0.0), "scf/d": (0.0283168466, 0.0), "MMSCFD": (28316.8466, 0.0)},
-    "Wellhead_Pressure": {"bar": (1.0, 0.0), "kPa": (0.01, 0.0), "MPa": (10.0, 0.0), "psi": (0.0689475729, 0.0), "kgf/cm²": (0.980665, 0.0)},
-    "Bottomhole_Pressure": {"bar": (1.0, 0.0), "kPa": (0.01, 0.0), "MPa": (10.0, 0.0), "psi": (0.0689475729, 0.0), "kgf/cm²": (0.980665, 0.0)},
-    "Motor_Temperature": {"°C": (1.0, 0.0), "°F": (5.0/9.0, -32.0*5.0/9.0)},
-    "Motor_Current": {"A": (1.0, 0.0), "mA": (0.001, 0.0)},
-    "Pump_Frequency": {"Hz": (1.0, 0.0), "rpm": (1.0/60.0, 0.0)},
-    "Pump_Vibration": {"mm/s": (1.0, 0.0), "in/s": (25.4, 0.0)},
-    "Energy_kWh": {"kWh": (1.0, 0.0), "Wh": (0.001, 0.0), "MWh": (1000.0, 0.0)},
-}
-STANDARD_UNITS = {"Oil_Rate": "m³/d", "Water_Rate": "m³/d", "Gas_Rate": "Sm³/d", "Injection_Rate": "m³/d", "Wellhead_Pressure": "bar", "Bottomhole_Pressure": "bar", "Motor_Temperature": "°C", "Motor_Current": "A", "Pump_Frequency": "Hz", "Pump_Vibration": "mm/s", "Energy_kWh": "kWh"}
-
-def clean_industrial_data(raw, unit_choices=None):
-    """Conservative, auditable cleanup. Converts explicitly selected source units to standard units."""
+def clean_industrial_data(raw):
+    """Conservative, auditable cleanup. Does not invent missing production targets."""
     frame, mapped, ignored = map_industrial_columns(raw)
-    unit_choices = unit_choices or {}
-    conversion_log = []
-    for col, unit in unit_choices.items():
-        if col not in frame.columns or col not in UNIT_OPTIONS or unit not in UNIT_OPTIONS[col]:
-            continue
-        factor, offset = UNIT_OPTIONS[col][unit]
-        target_unit = STANDARD_UNITS[col]
-        if col == "Injection_Rate" and unit in {"Sm³/d", "Mscf/d", "scf/d", "MMSCFD"}:
-            target_unit = "Sm³/d"
-        if unit != target_unit:
-            vals = pd.to_numeric(frame[col].astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
-            frame[col] = vals * factor + offset
-            conversion_log.append({"Field": col, "Source unit": unit, "Standard unit": target_unit, "Conversion": f"value × {factor:.10g} + {offset:.10g}"})
     report = {"input_rows": len(raw), "mapped_columns": mapped, "ignored_columns": ignored, "duplicates_removed": 0,
               "rows_without_date_or_well_removed": 0, "invalid_negative_rates_removed": 0,
-              "numeric_values_imputed": 0, "outlier_values_capped": 0, "unit_conversions": conversion_log, "notes": []}
+              "numeric_values_imputed": 0, "outlier_values_capped": 0, "notes": []}
     missing = [c for c in REQUIRED_COLUMNS if c not in frame.columns]
     if missing:
         report["missing_required"] = missing
@@ -219,22 +191,6 @@ template = pd.DataFrame({
 st.sidebar.download_button("Download CSV template", template.to_csv(index=False).encode(), file_name="fieldwise_operations_template.csv", mime="text/csv", use_container_width=True)
 uploaded_file = st.sidebar.file_uploader("Upload industrial CSV", type=["csv"], help="Messy headers and extra columns are allowed. The app maps known aliases and selects only relevant production/sensor columns.")
 
-# Units must be declared by the user or reliable source metadata; they cannot be safely guessed from numbers alone.
-unit_choices = {}
-if uploaded_file is not None:
-    try:
-        _unit_raw = pd.read_csv(uploaded_file)
-        _unit_frame, _unit_mapping, _unit_ignored = map_industrial_columns(_unit_raw)
-        st.sidebar.markdown("### Input units → standard units")
-        st.sidebar.caption("Choose the unit used in your uploaded file for each recognised field. Conversions happen before cleaning and modelling.")
-        for _field, _options in UNIT_OPTIONS.items():
-            if _field in _unit_frame.columns:
-                _default = STANDARD_UNITS[_field]
-                _choice = st.sidebar.selectbox(f"{_field} source unit", list(_options.keys()), index=list(_options.keys()).index(_default), key=f"unit_{_field}")
-                unit_choices[_field] = _choice
-    except Exception as _unit_error:
-        st.sidebar.warning(f"Could not inspect units yet: {_unit_error}")
-
 @st.cache_data
 def load_uploaded(file_bytes):
     return pd.read_csv(file_bytes)
@@ -247,7 +203,7 @@ df = make_demo_data()
 if uploaded_file is not None:
     try:
         raw_upload_preview = pd.read_csv(uploaded_file)
-        cleaned, cleaning_report = clean_industrial_data(raw_upload_preview, unit_choices)
+        cleaned, cleaning_report = clean_industrial_data(raw_upload_preview)
         if cleaned is None:
             missing = cleaning_report.get("missing_required", [])
             if missing:
@@ -399,13 +355,6 @@ elif page == "Data Cleaning":
         mapping = cleaning_report.get("mapped_columns", {})
         if mapping:
             st.dataframe(pd.DataFrame([{"FIELDWISE field": k, "Source column": v} for k,v in mapping.items()]), hide_index=True, use_container_width=True)
-        st.markdown("### Unit standardisation")
-        st.caption("Standard units used by this prototype: oil/water rate = m³/d; gas rate = Sm³/d; injection rate = m³/d for liquid or Sm³/d for gas (based on your selection); pressure = bar; motor temperature = °C; motor current = A; pump frequency = Hz; vibration = mm/s; energy = kWh.")
-        _conversion_rows = cleaning_report.get("unit_conversions", [])
-        if _conversion_rows:
-            st.dataframe(pd.DataFrame(_conversion_rows), hide_index=True, use_container_width=True)
-        else:
-            st.success("No unit conversion was needed for the selected source units, or all selected units already match the standard units.")
         st.markdown("### Ignored columns")
         ignored = cleaning_report.get("ignored_columns", [])
         if ignored:
@@ -426,7 +375,7 @@ elif page == "Data Cleaning":
     else:
         st.info("Upload a CSV in the sidebar to view the column mapping, cleaning report, and downloadable cleaned dataset. The built-in demo dataset is currently active.")
     st.markdown("### What this system does not do")
-    st.caption("It does not infer missing oil production from resistivity or gamma ray, cannot safely infer undocumented source units, and does not prove that a statistical outlier is an equipment fault. Confirm standard conditions for gas-volume units and review conversions with a petroleum engineer before operational use. Confirm unit conventions and any capped values with a petroleum engineer before operational use.")
+    st.caption("It does not infer missing oil production from resistivity or gamma ray, does not convert unknown units automatically, and does not prove that a statistical outlier is an equipment fault. Confirm unit conventions and any capped values with a petroleum engineer before operational use.")
 
 # ---------- Well Intelligence ----------
 elif page == "Well Intelligence":
