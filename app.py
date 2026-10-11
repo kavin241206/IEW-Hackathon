@@ -1,4 +1,5 @@
 import streamlit as st
+import io
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor, IsolationForest
@@ -84,6 +85,11 @@ def clean_industrial_data(raw, unit_choices=None):
     report = {"input_rows": len(raw), "mapped_columns": mapped, "ignored_columns": ignored, "duplicates_removed": 0,
               "rows_without_date_or_well_removed": 0, "invalid_negative_rates_removed": 0,
               "numeric_values_imputed": 0, "outlier_values_capped": 0, "unit_conversions": conversion_log, "notes": []}
+    # Injection is not present in every production export. Keep the file usable for surveillance,
+    # but explicitly mark missing injection as assumed zero; optimisation results must not be treated as field recommendations.
+    if "Injection_Rate" not in frame.columns:
+        frame["Injection_Rate"] = 0.0
+        report["notes"].append("Injection_Rate was absent and set to 0 for dashboard compatibility; allocation optimisation is not valid until real injection/lift-gas data and units are supplied.")
     missing = [c for c in REQUIRED_COLUMNS if c not in frame.columns]
     if missing:
         report["missing_required"] = missing
@@ -218,12 +224,14 @@ template = pd.DataFrame({
 })
 st.sidebar.download_button("Download CSV template", template.to_csv(index=False).encode(), file_name="fieldwise_operations_template.csv", mime="text/csv", use_container_width=True)
 uploaded_file = st.sidebar.file_uploader("Upload industrial CSV", type=["csv"], help="Messy headers and extra columns are allowed. The app maps known aliases and selects only relevant production/sensor columns.")
+# Streamlit upload objects are streams; read once into immutable bytes so each parser starts at byte 0.
+uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
 
 # Units must be declared by the user or reliable source metadata; they cannot be safely guessed from numbers alone.
 unit_choices = {}
-if uploaded_file is not None:
+if uploaded_bytes:
     try:
-        _unit_raw = pd.read_csv(uploaded_file)
+        _unit_raw = pd.read_csv(io.BytesIO(uploaded_bytes))
         _unit_frame, _unit_mapping, _unit_ignored = map_industrial_columns(_unit_raw)
         st.sidebar.markdown("### Input units → standard units")
         st.sidebar.caption("Choose the unit used in your uploaded file for each recognised field. Conversions happen before cleaning and modelling.")
@@ -237,16 +245,19 @@ if uploaded_file is not None:
 
 @st.cache_data
 def load_uploaded(file_bytes):
-    return pd.read_csv(file_bytes)
+    """Parse uploaded CSV bytes from a fresh stream on every call."""
+    if not file_bytes:
+        raise ValueError("The uploaded CSV is empty.")
+    return pd.read_csv(io.BytesIO(file_bytes))
 
 source = "Built-in illustrative dataset"
 upload_error = None
 cleaning_report = None
 raw_upload_preview = None
 df = make_demo_data()
-if uploaded_file is not None:
+if uploaded_bytes is not None:
     try:
-        raw_upload_preview = pd.read_csv(uploaded_file)
+        raw_upload_preview = load_uploaded(uploaded_bytes)
         cleaned, cleaning_report = clean_industrial_data(raw_upload_preview, unit_choices)
         if cleaned is None:
             missing = cleaning_report.get("missing_required", [])
