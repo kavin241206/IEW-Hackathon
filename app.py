@@ -1,3 +1,483 @@
+import streamlit as st
+import io
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor, IsolationForest
+from sklearn.metrics import mean_absolute_error
+import plotly.express as px
+import plotly.graph_objects as go
+
+st.set_page_config(page_title="FIELDWISE AI", page_icon="⛽", layout="wide")
+
+REQUIRED_COLUMNS = ["Date", "Well", "Oil_Rate", "Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"]
+NUMERIC_COLUMNS = ["Oil_Rate", "Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"]
+OPTIONAL_SENSOR_COLUMNS = ["Pump_Vibration", "Motor_Temperature", "Motor_Current", "Pump_Frequency", "Energy_kWh"]
+FEATURES = ["Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"]
+
+# Common industrial naming variants. Unknown columns (e.g. GR, RHOB, NPHI, resistivity)
+# are intentionally ignored by the production dashboard rather than fed into its models.
+COLUMN_ALIASES = {
+    "Date": ["date", "datetime", "timestamp", "time", "sample_date", "observation_date", "production_date"],
+    "Well": ["well", "well_id", "well name", "well_name", "wellno", "well_no", "uwi", "api", "well identifier"],
+    "Oil_Rate": ["oil_rate", "oil rate", "oil production", "oil production rate", "qo", "oil_volumetric_rate", "oil_m3_d", "oil rate (m3/d)", "oil rate (m³/d)"],
+    "Water_Rate": ["water_rate", "water rate", "water production", "water production rate", "qw", "water_volumetric_rate", "water_m3_d", "water rate (m3/d)", "water rate (m³/d)"],
+    "Gas_Rate": ["gas_rate", "gas rate", "gas production", "gas production rate", "qg", "gas_mscf_d", "gas rate (mcf/d)"],
+    "Wellhead_Pressure": ["wellhead_pressure", "wellhead pressure", "whp", "tubing_head_pressure", "thp", "well head pressure"],
+    "Bottomhole_Pressure": ["bottomhole_pressure", "bottom hole pressure", "bhp", "flowing_bottomhole_pressure", "fbhp", "bottom-hole pressure"],
+    "Injection_Rate": ["injection_rate", "injection rate", "injection", "gas_lift_rate", "gas lift rate", "lift_gas_rate", "lift gas rate", "water_injection_rate", "qinj"],
+    "Pump_Vibration": ["pump_vibration", "vibration", "vibration_rms", "pump vibration"],
+    "Motor_Temperature": ["motor_temperature", "motor temp", "motor_temperature_c", "motor temperature", "motor_temp"],
+    "Motor_Current": ["motor_current", "current", "motor amps", "motor_current_a", "motor current"],
+    "Pump_Frequency": ["pump_frequency", "frequency", "vfd_frequency", "pump frequency", "frequency_hz"],
+    "Energy_kWh": ["energy_kwh", "energy", "energy_kwh", "power_consumption_kwh", "energy consumed", "energy consumption"]
+}
+
+def _key(name):
+    return " ".join(str(name).strip().lower().replace("_", " ").replace("-", " ").split())
+
+def map_industrial_columns(raw):
+    """Map recognised source headers to FIELDWISE names; discard unneeded columns."""
+    df = raw.copy()
+    aliases = {_key(alias): canonical for canonical, names in COLUMN_ALIASES.items() for alias in [canonical, *names]}
+    rename = {}
+    mapped = {}
+    for col in df.columns:
+        canonical = aliases.get(_key(col))
+        if canonical and canonical not in mapped:
+            rename[col] = canonical
+            mapped[canonical] = col
+    df = df.rename(columns=rename)
+    selected = [c for c in REQUIRED_COLUMNS + OPTIONAL_SENSOR_COLUMNS if c in df.columns]
+    ignored = [str(c) for c in raw.columns if c not in mapped.values()]
+    return df[selected].copy(), mapped, ignored
+
+UNIT_OPTIONS = {
+    "Oil_Rate": {"m³/d": (1.0, 0.0), "bbl/d": (0.1589872949, 0.0), "STB/d": (0.1589872949, 0.0), "m³/h": (24.0, 0.0), "L/s": (86.4, 0.0), "L/min": (1.44, 0.0), "ft³/d": (0.0283168466, 0.0)},
+    "Water_Rate": {"m³/d": (1.0, 0.0), "bbl/d": (0.1589872949, 0.0), "STB/d": (0.1589872949, 0.0), "m³/h": (24.0, 0.0), "L/s": (86.4, 0.0), "L/min": (1.44, 0.0), "ft³/d": (0.0283168466, 0.0)},
+    "Gas_Rate": {"Sm³/d": (1.0, 0.0), "Mscf/d": (28.3168466, 0.0), "scf/d": (0.0283168466, 0.0), "MMSCFD": (28316.8466, 0.0), "Nm³/h": (24.0, 0.0)},
+    "Injection_Rate": {"m³/d": (1.0, 0.0), "bbl/d": (0.1589872949, 0.0), "STB/d": (0.1589872949, 0.0), "m³/h": (24.0, 0.0), "L/s": (86.4, 0.0), "ft³/d": (0.0283168466, 0.0), "Sm³/d": (1.0, 0.0), "Mscf/d": (28.3168466, 0.0), "scf/d": (0.0283168466, 0.0), "MMSCFD": (28316.8466, 0.0)},
+    "Wellhead_Pressure": {"bar": (1.0, 0.0), "kPa": (0.01, 0.0), "MPa": (10.0, 0.0), "psi": (0.0689475729, 0.0), "kgf/cm²": (0.980665, 0.0)},
+    "Bottomhole_Pressure": {"bar": (1.0, 0.0), "kPa": (0.01, 0.0), "MPa": (10.0, 0.0), "psi": (0.0689475729, 0.0), "kgf/cm²": (0.980665, 0.0)},
+    "Motor_Temperature": {"°C": (1.0, 0.0), "°F": (5.0/9.0, -32.0*5.0/9.0)},
+    "Motor_Current": {"A": (1.0, 0.0), "mA": (0.001, 0.0)},
+    "Pump_Frequency": {"Hz": (1.0, 0.0), "rpm": (1.0/60.0, 0.0)},
+    "Pump_Vibration": {"mm/s": (1.0, 0.0), "in/s": (25.4, 0.0)},
+    "Energy_kWh": {"kWh": (1.0, 0.0), "Wh": (0.001, 0.0), "MWh": (1000.0, 0.0)},
+}
+STANDARD_UNITS = {"Oil_Rate": "m³/d", "Water_Rate": "m³/d", "Gas_Rate": "Sm³/d", "Injection_Rate": "m³/d", "Wellhead_Pressure": "bar", "Bottomhole_Pressure": "bar", "Motor_Temperature": "°C", "Motor_Current": "A", "Pump_Frequency": "Hz", "Pump_Vibration": "mm/s", "Energy_kWh": "kWh"}
+
+def clean_industrial_data(raw, unit_choices=None):
+    """Conservative, auditable cleanup. Converts explicitly selected source units to standard units."""
+    frame, mapped, ignored = map_industrial_columns(raw)
+    unit_choices = unit_choices or {}
+    conversion_log = []
+    for col, unit in unit_choices.items():
+        if col not in frame.columns or col not in UNIT_OPTIONS or unit not in UNIT_OPTIONS[col]:
+            continue
+        factor, offset = UNIT_OPTIONS[col][unit]
+        target_unit = STANDARD_UNITS[col]
+        if col == "Injection_Rate" and unit in {"Sm³/d", "Mscf/d", "scf/d", "MMSCFD"}:
+            target_unit = "Sm³/d"
+        if unit != target_unit:
+            vals = pd.to_numeric(frame[col].astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+            frame[col] = vals * factor + offset
+            conversion_log.append({"Field": col, "Source unit": unit, "Standard unit": target_unit, "Conversion": f"value × {factor:.10g} + {offset:.10g}"})
+    report = {"input_rows": len(raw), "mapped_columns": mapped, "ignored_columns": ignored, "duplicates_removed": 0,
+              "rows_without_date_or_well_removed": 0, "invalid_negative_rates_removed": 0,
+              "numeric_values_imputed": 0, "outlier_values_capped": 0, "unit_conversions": conversion_log, "notes": []}
+    # Injection is not present in every production export. Keep the file usable for surveillance,
+    # but explicitly mark missing injection as assumed zero; optimisation results must not be treated as field recommendations.
+    if "Injection_Rate" not in frame.columns:
+        frame["Injection_Rate"] = 0.0
+        report["notes"].append("Injection_Rate was absent and set to 0 for dashboard compatibility; allocation optimisation is not valid until real injection/lift-gas data and units are supplied.")
+    missing = [c for c in REQUIRED_COLUMNS if c not in frame.columns]
+    if missing:
+        report["missing_required"] = missing
+        return None, report
+    # Parse mixed date formats; unparseable timestamps are removed and reported.
+    try:
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", format="mixed", dayfirst=False)
+    except (TypeError, ValueError):
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame["Well"] = frame["Well"].astype("string").str.strip().str.upper()
+    frame["Well"] = frame["Well"].replace({"": pd.NA, "NAN": pd.NA, "NONE": pd.NA, "<NA>": pd.NA})
+    before = len(frame)
+    frame = frame.dropna(subset=["Date", "Well"]).copy()
+    report["rows_without_date_or_well_removed"] = before - len(frame)
+    before = len(frame)
+    frame = frame.drop_duplicates().copy()
+    report["duplicates_removed"] = before - len(frame)
+    numeric = [c for c in NUMERIC_COLUMNS + OPTIONAL_SENSOR_COLUMNS if c in frame.columns]
+    for col in numeric:
+        original_nonmissing = frame[col].notna().sum()
+        frame[col] = pd.to_numeric(frame[col].astype(str).str.replace(",", "", regex=False).str.strip().replace({"": np.nan, "N/A": np.nan, "NA": np.nan, "unknown": np.nan, "—": np.nan, "-": np.nan}), errors="coerce")
+        frame[col] = frame[col].replace([np.inf, -np.inf], np.nan)
+        report["numeric_values_imputed"] += int(frame[col].isna().sum())
+    # Negative production/injection rates are invalid for this use case; treat as missing, not zero.
+    for col in [c for c in ["Oil_Rate", "Water_Rate", "Gas_Rate", "Injection_Rate"] if c in frame.columns]:
+        mask = frame[col] < 0
+        report["invalid_negative_rates_removed"] += int(mask.sum())
+        frame.loc[mask, col] = np.nan
+    frame = frame.sort_values(["Well", "Date"]).reset_index(drop=True)
+    # Fill gaps within each well using time-series interpolation, then the field median.
+    for col in numeric:
+        missing_before = int(frame[col].isna().sum())
+        frame[col] = frame.groupby("Well", group_keys=False)[col].transform(lambda x: x.interpolate(limit_direction="both"))
+        if frame[col].isna().any():
+            median = frame[col].median()
+            if pd.notna(median):
+                frame[col] = frame[col].fillna(median)
+        report["numeric_values_imputed"] += max(0, int(frame[col].isna().sum()) - missing_before)
+    # Cap statistical extremes with 1.5*IQR fences; keep the count transparent.
+    # This is a generic safeguard, not a substitute for physical operating limits.
+    for col in numeric:
+        q1, q3 = frame[col].quantile([0.25, 0.75]) if frame[col].notna().any() else (np.nan, np.nan)
+        if pd.notna(q1) and pd.notna(q3) and q3 > q1:
+            iqr = q3 - q1
+            lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
+            mask = (frame[col] < lo) | (frame[col] > hi)
+            report["outlier_values_capped"] += int(mask.sum())
+            frame[col] = frame[col].clip(lo, hi)
+    frame = frame.dropna(subset=["Oil_Rate", "Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"])
+    if len(frame) < 20:
+        report["error"] = f"Only {len(frame)} usable rows remain after cleaning; at least 20 are needed."
+        return None, report
+    if frame["Date"].nunique() < 2:
+        report["error"] = "At least two distinct dates are required for chronological validation."
+        return None, report
+    report["output_rows"] = len(frame)
+    report["rows_removed_total"] = len(raw) - len(frame)
+    report["notes"].append("Unrecognised columns were ignored; no missing oil/water/gas/pressure/injection targets were fabricated.")
+    report["notes"].append("Missing numeric values were interpolated within each well where possible, then filled with the field median.")
+    report["notes"].append("Statistical outliers were capped at 1.5×IQR fences. Review these values with engineering limits before operational use.")
+    return frame.reset_index(drop=True), report
+
+# ---------- Styling ----------
+st.markdown("""
+<style>
+.stApp {background:radial-gradient(circle at 84% 7%,rgba(73,174,158,.13),transparent 25%),radial-gradient(circle at 12% 88%,rgba(45,103,133,.13),transparent 30%),linear-gradient(135deg,#061017 0%,#091720 50%,#071018 100%);color:#EAF2F7;}
+.stApp:before {content:"";position:fixed;inset:0;pointer-events:none;opacity:.16;background-image:linear-gradient(rgba(112,171,184,.055) 1px,transparent 1px),linear-gradient(90deg,rgba(112,171,184,.055) 1px,transparent 1px);background-size:42px 42px;}
+.block-container{padding-top:1.2rem;max-width:1450px;}
+[data-testid="stSidebar"]{background:linear-gradient(180deg,#07131b 0%,#091821 100%);border-right:1px solid #20323d;}
+[data-testid="stSidebar"]>div:first-child{padding-top:1.2rem;}
+[data-testid="stSidebar"] .stRadio>label{color:#8EA3AE;font-size:11px;text-transform:uppercase;letter-spacing:1.4px;}
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"]{gap:5px;}
+[data-testid="stSidebar"] .stRadio div[role="radiogroup"] label{border-radius:9px;padding:7px 9px;}
+.hero{padding:30px 36px;border:1px solid #233541;border-radius:20px;background:linear-gradient(135deg,#0c1d28,#0a141b);margin-bottom:22px;}
+.brand{font-size:14px;letter-spacing:4px;font-weight:800;color:#77D6C8;}
+.hero h1{font-size:40px;margin:8px 0 6px;}
+.hero p{font-size:16px;color:#AFC1CB;max-width:900px;}
+.badge{display:inline-block;padding:6px 10px;border-radius:20px;background:#14322f;color:#86E3D2;font-size:12px;font-weight:700;}
+.kpi{background:#0d1b24;border:1px solid #223541;border-radius:15px;padding:17px;min-height:108px;}
+.kpi-label{color:#8EA3AE;font-size:12px;text-transform:uppercase;letter-spacing:1.2px;}
+.kpi-value{font-size:27px;font-weight:800;margin-top:6px;overflow-wrap:anywhere;}
+.kpi-sub{color:#718792;font-size:12px;margin-top:4px;}
+.card{background:#0d1b24;border:1px solid #223541;border-radius:15px;padding:18px;}
+.section-kicker{color:#65CFC0;text-transform:uppercase;letter-spacing:2px;font-size:11px;font-weight:800;margin-top:10px;}
+.section-title{margin-top:3px;}
+.alert{border-left:4px solid #65CFC0;background:#0d2026;padding:14px 16px;border-radius:8px;}
+.warn{border-left-color:#E7B85B;background:#251f11;}
+.small{color:#8EA3AE;font-size:13px;}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Demo data ----------
+@st.cache_data
+def make_demo_data():
+    rng = np.random.default_rng(42)
+    dates = pd.date_range("2024-01-01", periods=180, freq="D")
+    wells = [f"W-{i:03d}" for i in range(1, 13)]
+    rows = []
+    for wi, well in enumerate(wells):
+        base_oil = 145 - wi * 5 + rng.normal(0, 4)
+        base_water = 30 + wi * 4
+        for t, d in enumerate(dates):
+            decline = np.exp(-t / (260 + wi * 15))
+            injection = max(5, 55 + 10*np.sin(t/25 + wi/3) + rng.normal(0, 3))
+            bhp = 190 - wi*2 + 7*np.sin(t/30 + wi) + rng.normal(0, 2)
+            whp = 105 - wi + 4*np.sin(t/18) + rng.normal(0, 1.5)
+            water = max(5, base_water + 0.055*t + 0.16*injection + rng.normal(0, 3))
+            gas = max(20, 65 + 12*np.sin(t/20 + wi) + rng.normal(0, 5))
+            oil = max(15, base_oil*decline + 0.26*injection + 0.15*bhp - 20 - 0.10*water + rng.normal(0, 4))
+            # Synthetic equipment signals for demonstrating monitoring only.
+            vib = max(0.1, 2.0 + 0.004*t + 0.10*wi + rng.normal(0, .22))
+            temp = 68 + 0.025*t + 0.7*wi + 2*np.sin(t/17+wi) + rng.normal(0, 1.6)
+            current = max(1, 35 + 0.22*oil + 0.05*water + rng.normal(0, 3))
+            freq = np.clip(48 + 2*np.sin(t/22+wi) + rng.normal(0, 1), 35, 60)
+            energy = max(1, current*freq*0.15 + rng.normal(0, 3))
+            # Insert a few illustrative abnormal periods in sensor signals.
+            if wi in (2, 7) and 125 <= t <= 137:
+                vib += 2.2
+                temp += 9
+            rows.append([d, well, oil, water, gas, whp, bhp, injection, vib, temp, current, freq, energy])
+    cols = REQUIRED_COLUMNS + OPTIONAL_SENSOR_COLUMNS
+    return pd.DataFrame(rows, columns=cols)
+
+# ---------- Upload, column selection and automatic cleaning ----------
+st.sidebar.markdown("### Data ingestion")
+template = pd.DataFrame({
+    "Date": ["2026-01-01", "2026-01-02"], "Well": ["W-001", "W-001"],
+    "Oil_Rate": [85.0, 84.2], "Water_Rate": [74.0, 75.0], "Gas_Rate": [62.0, 61.5],
+    "Wellhead_Pressure": [100.0, 99.5], "Bottomhole_Pressure": [172.0, 171.5], "Injection_Rate": [55.0, 56.0],
+    "Pump_Vibration": [2.1, 2.2], "Motor_Temperature": [72.0, 72.4], "Motor_Current": [54.0, 53.5],
+    "Pump_Frequency": [48.0, 48.0], "Energy_kWh": [390.0, 388.0]
+})
+st.sidebar.download_button("Download CSV template", template.to_csv(index=False).encode(), file_name="fieldwise_operations_template.csv", mime="text/csv", use_container_width=True)
+uploaded_file = st.sidebar.file_uploader("Upload industrial CSV", type=["csv"], help="Messy headers and extra columns are allowed. The app maps known aliases and selects only relevant production/sensor columns.")
+# Streamlit upload objects are streams; read once into immutable bytes so each parser starts at byte 0.
+uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
+
+# Units must be declared by the user or reliable source metadata; they cannot be safely guessed from numbers alone.
+unit_choices = {}
+if uploaded_bytes:
+    try:
+        _unit_raw = pd.read_csv(io.BytesIO(uploaded_bytes))
+        _unit_frame, _unit_mapping, _unit_ignored = map_industrial_columns(_unit_raw)
+        st.sidebar.markdown("### Input units → standard units")
+        st.sidebar.caption("Choose the unit used in your uploaded file for each recognised field. Conversions happen before cleaning and modelling.")
+        for _field, _options in UNIT_OPTIONS.items():
+            if _field in _unit_frame.columns:
+                _default = STANDARD_UNITS[_field]
+                _choice = st.sidebar.selectbox(f"{_field} source unit", list(_options.keys()), index=list(_options.keys()).index(_default), key=f"unit_{_field}")
+                unit_choices[_field] = _choice
+    except Exception as _unit_error:
+        st.sidebar.warning(f"Could not inspect units yet: {_unit_error}")
+
+@st.cache_data
+def load_uploaded(file_bytes):
+    """Parse uploaded CSV bytes from a fresh stream on every call."""
+    if not file_bytes:
+        raise ValueError("The uploaded CSV is empty.")
+    return pd.read_csv(io.BytesIO(file_bytes))
+
+source = "Built-in illustrative dataset"
+upload_error = None
+cleaning_report = None
+raw_upload_preview = None
+df = make_demo_data()
+if uploaded_bytes is not None:
+    try:
+        raw_upload_preview = load_uploaded(uploaded_bytes)
+        cleaned, cleaning_report = clean_industrial_data(raw_upload_preview, unit_choices)
+        if cleaned is None:
+            missing = cleaning_report.get("missing_required", [])
+            if missing:
+                raise ValueError("Could not identify required operational fields: " + ", ".join(missing) + ". This appears to be a well-log/reservoir dataset or uses unrecognised headers. A production optimisation run needs date, well ID, oil rate, water rate, gas rate, wellhead pressure, bottomhole pressure and injection/lift-gas rate. Extra log curves such as GR, RHOB, NPHI and resistivity will be ignored.")
+            raise ValueError(cleaning_report.get("error", "Data could not be cleaned."))
+        # Equipment placeholder values are added only when real sensor columns are absent.
+        synthetic_sensor_columns = []
+        rng = np.random.default_rng(7)
+        for c, base, spread in [("Pump_Vibration", 2.0, .25), ("Motor_Temperature", 72.0, 2.0), ("Motor_Current", 50.0, 4.0), ("Pump_Frequency", 48.0, 1.5), ("Energy_kWh", 380.0, 15.0)]:
+            if c not in cleaned.columns:
+                cleaned[c] = np.maximum(0, rng.normal(base, spread, len(cleaned)))
+                synthetic_sensor_columns.append(c)
+        cleaning_report["synthetic_sensor_columns"] = synthetic_sensor_columns
+        df = cleaned.sort_values(["Date", "Well"]).reset_index(drop=True)
+        source = f"User-uploaded data · {uploaded_file.name}"
+    except Exception as e:
+        upload_error = str(e)
+        df = make_demo_data()
+
+# ---------- ML model and derived metrics ----------
+def train_proxy(frame):
+    split = frame["Date"].quantile(.8)
+    train = frame[frame["Date"] <= split]
+    test = frame[frame["Date"] > split]
+    if len(train) < 10 or len(test) < 2:
+        raise ValueError("Not enough rows for chronological train/test validation.")
+    model = RandomForestRegressor(n_estimators=160, max_depth=10, min_samples_leaf=3, random_state=42)
+    model.fit(train[FEATURES], train["Oil_Rate"])
+    pred = model.predict(test[FEATURES])
+    return model, mean_absolute_error(test["Oil_Rate"], pred), test.assign(Predicted_Oil=pred)
+
+try:
+    model, mae, test_df = train_proxy(df)
+except Exception as e:
+    upload_error = str(e)
+    df = make_demo_data()
+    source = "Built-in illustrative dataset (uploaded data could not be modelled)"
+    model, mae, test_df = train_proxy(df)
+
+latest = df.sort_values("Date").groupby("Well", as_index=False).tail(1).copy()
+latest["Water_Cut"] = (latest["Water_Rate"] / (latest["Water_Rate"] + latest["Oil_Rate"]).replace(0, np.nan) * 100).fillna(0)
+
+def priority(r):
+    if r["Oil_Rate"] < 80 and r["Water_Cut"] > 40: return "CRITICAL"
+    if r["Oil_Rate"] < 95 or r["Water_Cut"] > 35: return "HIGH"
+    if r["Water_Cut"] > 28 or r["Oil_Rate"] < 110: return "WATCH"
+    return "STABLE"
+latest["Priority"] = latest.apply(priority, axis=1)
+
+sensor_cols = [c for c in OPTIONAL_SENSOR_COLUMNS if c in df.columns]
+sensor_features = ["Pump_Vibration", "Motor_Temperature", "Motor_Current", "Pump_Frequency", "Energy_kWh"]
+# Fit an anomaly model on the latest well observations. This is screening, not a certified failure forecast.
+try:
+    iso = IsolationForest(contamination=0.12, random_state=42)
+    iso.fit(latest[sensor_features])
+    latest["Anomaly"] = np.where(iso.predict(latest[sensor_features]) == -1, "ALERT", "NORMAL")
+    latest["Anomaly_Score"] = -iso.score_samples(latest[sensor_features])
+except Exception:
+    latest["Anomaly"] = "UNAVAILABLE"
+    latest["Anomaly_Score"] = 0.0
+
+# ---------- UI helpers ----------
+def kpi(label, value, sub=""):
+    st.markdown(f'<div class="kpi"><div class="kpi-label">{label}</div><div class="kpi-value">{value}</div><div class="kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
+def section(title, kicker=""):
+    st.markdown(f'<div class="section-kicker">{kicker}</div><h2 class="section-title">{title}</h2>', unsafe_allow_html=True)
+
+page = st.sidebar.radio("Navigation", ["Command Centre", "Data Input", "Data Cleaning", "Well Intelligence", "Equipment Health", "Production Optimisation", "Field Analytics", "Explainable AI", "Methodology"])
+st.sidebar.markdown('<div style="margin-top:28px;padding-top:10px;border-top:1px solid #20323d;color:#6F858F;font-size:11px;letter-spacing:.5px;text-align:center;">designed by Kavinkarthick</div>', unsafe_allow_html=True)
+
+st.markdown('''<div class="hero"><div class="brand">FIELDWISE AI</div><span class="badge">MATURE FIELD OPERATIONS INTELLIGENCE</span><h1>Optimise production. Anticipate equipment issues.</h1><p>An AI-assisted decision-support prototype combining well surveillance, equipment anomaly screening and multi-well operating-scenario comparison for mature oil and gas fields.</p></div>''', unsafe_allow_html=True)
+
+# ---------- Command Centre ----------
+if page == "Command Centre":
+    section("Field Operations Command Centre", "EXECUTIVE VIEW")
+    if upload_error: st.warning(f"Uploaded data was not accepted: {upload_error}. The built-in illustrative dataset is being used.")
+    elif source.startswith("User-uploaded"): st.success(f"Dashboard data source: {uploaded_file.name}")
+    oil_total = latest["Oil_Rate"].sum()
+    water_total = latest["Water_Rate"].sum()
+    weighted_wc = 100*water_total/(oil_total+water_total) if oil_total+water_total else 0
+    c1,c2,c3,c4 = st.columns(4)
+    with c1: kpi("Producing wells", f"{latest['Well'].nunique()}", "latest observation per well")
+    with c2: kpi("Total oil rate", f"{oil_total:,.1f} m³/d", "field total")
+    with c3: kpi("Field water cut", f"{weighted_wc:.1f}%", "liquid-rate weighted")
+    with c4: kpi("Equipment alerts", int((latest["Anomaly"] == "ALERT").sum()), "anomaly-screening flags")
+    left,right = st.columns([1.35,1])
+    with left:
+        section("Field production trend", "PRODUCTION SURVEILLANCE")
+        trend = df.groupby("Date")[["Oil_Rate", "Water_Rate"]].sum().reset_index()
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=trend.Date, y=trend.Oil_Rate, name="Oil rate", mode="lines"))
+        fig.add_trace(go.Scatter(x=trend.Date, y=trend.Water_Rate, name="Water rate", mode="lines"))
+        fig.update_layout(template="plotly_dark", height=330, margin=dict(l=10,r=10,t=10,b=10), yaxis_title="Rate (m³/d)")
+        st.plotly_chart(fig, use_container_width=True)
+    with right:
+        section("Wells requiring attention", "SCREENING QUEUE")
+        order = {"CRITICAL":0,"HIGH":1,"WATCH":2,"STABLE":3}
+        queue = latest.copy(); queue["_rank"] = queue.Priority.map(order)
+        queue = queue.sort_values(["_rank","Water_Cut"], ascending=[True,False]).head(8)
+        st.dataframe(queue[["Well","Oil_Rate","Water_Cut","Priority","Anomaly"]].rename(columns={"Oil_Rate":"Oil rate (m³/d)","Water_Cut":"Water cut (%)"}), hide_index=True, use_container_width=True)
+    section("Operational signals", "EQUIPMENT & ENERGY")
+    a,b,c = st.columns(3)
+    with a:
+        fig = px.bar(latest, x="Well", y="Pump_Vibration", color="Anomaly", title="Latest pump vibration (demo units)")
+        fig.update_layout(template="plotly_dark", height=280); st.plotly_chart(fig, use_container_width=True)
+    with b:
+        fig = px.scatter(latest, x="Motor_Temperature", y="Motor_Current", color="Anomaly", size="Oil_Rate", hover_name="Well", title="Motor signal screening")
+        fig.update_layout(template="plotly_dark", height=280); st.plotly_chart(fig, use_container_width=True)
+    with c:
+        fig = px.bar(latest, x="Well", y="Energy_kWh", color="Priority", title="Energy indicator (source units)")
+        fig.update_layout(template="plotly_dark", height=280); st.plotly_chart(fig, use_container_width=True)
+    st.caption("Equipment flags are anomaly-screening outputs. They are not confirmed failures; validate against equipment-specific limits and maintenance records.")
+
+# ---------- Data Input ----------
+elif page == "Data Input":
+    section("Bring Your Field Data", "DATA IMPORT")
+    if upload_error: st.error(upload_error)
+    elif source.startswith("User-uploaded"): st.success(f"Mapped, cleaned and loaded {uploaded_file.name}; the selected operational columns power the dashboard and oil-rate proxy model.")
+    else: st.info("Upload an industrial CSV from the sidebar. Known aliases are mapped automatically, relevant columns are selected, and common data-quality issues are cleaned before modelling.")
+    a,b,c = st.columns(3)
+    with a: kpi("Rows loaded", f"{len(df):,}", "well-date observations")
+    with b: kpi("Wells", f"{df['Well'].nunique()}", "unique well IDs")
+    with c: kpi("History", f"{df['Date'].min():%d %b %Y} – {df['Date'].max():%d %b %Y}", "available date range")
+    st.markdown("### Required columns")
+    req_desc = ["Observation date","Unique well identifier","Oil production rate (m³/d)","Water production rate (m³/d)","Gas rate (keep units consistent)","Wellhead pressure (keep units consistent)","Bottom-hole pressure (keep units consistent)","Injection or lift-gas rate (keep units consistent)"]
+    st.dataframe(pd.DataFrame({"Column":REQUIRED_COLUMNS,"Meaning":req_desc}), hide_index=True, use_container_width=True)
+    st.markdown("### Optional equipment columns")
+    opt_desc = ["Pump vibration measurement","Motor temperature","Motor current","Pump operating frequency","Energy consumed over the observation interval"]
+    st.dataframe(pd.DataFrame({"Column":OPTIONAL_SENSOR_COLUMNS,"Meaning":opt_desc}), hide_index=True, use_container_width=True)
+    st.caption("One row should represent one well at one timestamp. Extra columns such as resistivity and gamma ray are ignored by this production workflow. Missing sensor columns are filled with synthetic placeholders for the demo only—not real equipment evidence.")
+    st.markdown("### Data preview")
+    st.dataframe(df.head(25), hide_index=True, use_container_width=True)
+    st.download_button("Download currently loaded data", df.to_csv(index=False).encode(), file_name="fieldwise_loaded_data.csv", mime="text/csv")
+
+# ---------- Data Cleaning ----------
+elif page == "Data Cleaning":
+    section("Automatic Data Cleaning & Column Selection", "INGESTION QUALITY GATE")
+    st.write("FIELDWISE AI first recognises common industrial header variants, selects the production and sensor fields it understands, and ignores unrelated columns. It then parses dates, standardises well IDs, converts numeric fields, removes exact duplicates and unusable timestamps, handles missing values, and caps statistical outliers using 1.5×IQR fences.")
+    if upload_error:
+        st.error(upload_error)
+        st.info("A pure well-log file containing only depth, gamma ray, resistivity, density or porosity cannot run the production optimiser by itself. Those curves can be stored for a separate reservoir-characterisation module, but production optimisation needs dated well operating data.")
+    elif cleaning_report and source.startswith("User-uploaded"):
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: kpi("Input rows", f"{cleaning_report.get('input_rows', 0):,}", "before cleaning")
+        with c2: kpi("Rows loaded", f"{len(df):,}", "after cleaning")
+        with c3: kpi("Duplicate rows removed", f"{cleaning_report.get('duplicates_removed', 0):,}", "exact duplicates")
+        with c4: kpi("Outlier values capped", f"{cleaning_report.get('outlier_values_capped', 0):,}", "1.5×IQR fences")
+        st.markdown("### Column mapping")
+        mapping = cleaning_report.get("mapped_columns", {})
+        if mapping:
+            st.dataframe(pd.DataFrame([{"FIELDWISE field": k, "Source column": v} for k,v in mapping.items()]), hide_index=True, use_container_width=True)
+        st.markdown("### Unit standardisation")
+        st.caption("Standard units used by this prototype: oil/water rate = m³/d; gas rate = Sm³/d; injection rate = m³/d for liquid or Sm³/d for gas (based on your selection); pressure = bar; motor temperature = °C; motor current = A; pump frequency = Hz; vibration = mm/s; energy = kWh.")
+        _conversion_rows = cleaning_report.get("unit_conversions", [])
+        if _conversion_rows:
+            st.dataframe(pd.DataFrame(_conversion_rows), hide_index=True, use_container_width=True)
+        else:
+            st.success("No unit conversion was needed for the selected source units, or all selected units already match the standard units.")
+        st.markdown("### Ignored columns")
+        ignored = cleaning_report.get("ignored_columns", [])
+        if ignored:
+            st.write(", ".join(ignored))
+        else:
+            st.write("No extra columns were ignored.")
+        st.markdown("### Cleaning actions")
+        st.write(f"- Rows removed for missing/unparseable date or well ID: **{cleaning_report.get('rows_without_date_or_well_removed', 0)}**")
+        st.write(f"- Negative rate values treated as missing: **{cleaning_report.get('invalid_negative_rates_removed', 0)}**")
+        st.write(f"- Numeric values imputed/remaining missing-value handling count: **{cleaning_report.get('numeric_values_imputed', 0)}**")
+        for note in cleaning_report.get("notes", []): st.caption("• " + note)
+        synthetic = cleaning_report.get("synthetic_sensor_columns", [])
+        if synthetic:
+            st.warning("No real data supplied for these equipment fields; demo placeholders were generated: " + ", ".join(synthetic) + ". Do not interpret their alerts as evidence of equipment condition.")
+        st.markdown("### Cleaned data preview")
+        st.dataframe(df.head(30), hide_index=True, use_container_width=True)
+        st.download_button("Download cleaned and selected CSV", df.to_csv(index=False).encode("utf-8"), file_name="fieldwise_cleaned_selected_data.csv", mime="text/csv", use_container_width=True)
+    else:
+        st.info("Upload a CSV in the sidebar to view the column mapping, cleaning report, and downloadable cleaned dataset. The built-in demo dataset is currently active.")
+    st.markdown("### What this system does not do")
+    st.caption("It does not infer missing oil production from resistivity or gamma ray, cannot safely infer undocumented source units, and does not prove that a statistical outlier is an equipment fault. Confirm standard conditions for gas-volume units and review conversions with a petroleum engineer before operational use. Confirm unit conventions and any capped values with a petroleum engineer before operational use.")
+
+# ---------- Well Intelligence ----------
+elif page == "Well Intelligence":
+    section("Well Intelligence", "WELL-LEVEL SURVEILLANCE")
+    well = st.selectbox("Select well", latest.Well.tolist())
+    hist = df[df.Well == well].sort_values("Date").copy()
+    row = latest[latest.Well == well].iloc[0]
+    wc = row.Water_Cut
+    recent = hist.tail(min(30, len(hist)))
+    oil_change = (recent.Oil_Rate.iloc[-1]/recent.Oil_Rate.iloc[0]-1)*100 if len(recent)>1 and recent.Oil_Rate.iloc[0] else 0
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: kpi("Oil rate", f"{row.Oil_Rate:.1f} m³/d", "latest")
+    with c2: kpi("Water rate", f"{row.Water_Rate:.1f} m³/d", "latest")
+    with c3: kpi("Water cut", f"{wc:.1f}%", "latest")
+    with c4: kpi("Bottom-hole pressure", f"{row.Bottomhole_Pressure:.1f}", "source pressure units")
+    with c5: kpi("Priority", row.Priority, "rule-based screen")
+    a,b = st.columns(2)
+    with a:
+        fig = px.line(hist, x="Date", y="Oil_Rate", title="Oil production history")
+        fig.update_layout(template="plotly_dark", height=320, yaxis_title="Oil rate (m³/d)"); st.plotly_chart(fig, use_container_width=True)
+    with b:
+        hist["Water_Cut"] = 100*hist.Water_Rate/(hist.Water_Rate+hist.Oil_Rate).replace(0,np.nan)
+        fig = px.line(hist, x="Date", y="Water_Cut", title="Water-cut history")
+        fig.update_layout(template="plotly_dark", height=320, yaxis_title="Water cut (%)"); st.plotly_chart(fig, use_container_width=True)
+    section("Screening indicators", "ENGINEERING REVIEW")
+    reasons=[]
+    if oil_change < -5: reasons.append(f"Oil rate changed by {oil_change:.1f}% across the latest {len(recent)} observations.")
+    if wc > 35: reasons.append("Water cut is elevated under the prototype's screening threshold.")
+    if row.Anomaly == "ALERT": reasons.append("The latest equipment-sensor pattern is flagged as anomalous by the screening model.")
+    if not reasons: reasons.append("No configured screening trigger detected; continue normal surveillance.")
+    st.markdown('<div class="alert">' + "<br>".join("• "+x for x in reasons) + '</div>', unsafe_allow_html=True)
+    st.caption("Screening indicators identify what to investigate; they do not diagnose the reservoir or confirm a mechanical failure.")
+
+# ---------- Equipment Health ----------
+elif page == "Equipment Health":
+    section("Equipment Health & Anomaly Screening", "ARTIFICIAL-LIFT SURVEILLANCE")
+    st.markdown("The prototype uses Isolation Forest to flag unusual combinations of the available sensor variables. It is an anomaly screen—not a labelled failure-prediction model.")
+    a,b,c = st.columns(3)
+    with a: kpi("Wells flagged", int((latest.Anomaly=="ALERT").sum()), "latest observations")
+    with b: kpi("Wells screened", len(latest), "one latest row per well")
     with c: kpi("Sensor variables", len(sensor_features), "vibration, temperature, current, frequency, energy")
     table = latest[["Well","Pump_Vibration","Motor_Temperature","Motor_Current","Pump_Frequency","Energy_kWh","Anomaly","Anomaly_Score"]].sort_values("Anomaly_Score",ascending=False)
     st.dataframe(table.rename(columns={"Pump_Vibration":"Vibration","Motor_Temperature":"Motor temp","Motor_Current":"Motor current","Pump_Frequency":"Frequency","Energy_kWh":"Energy","Anomaly_Score":"Anomaly score"}), hide_index=True, use_container_width=True)
