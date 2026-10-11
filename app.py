@@ -13,6 +13,111 @@ NUMERIC_COLUMNS = ["Oil_Rate", "Water_Rate", "Gas_Rate", "Wellhead_Pressure", "B
 OPTIONAL_SENSOR_COLUMNS = ["Pump_Vibration", "Motor_Temperature", "Motor_Current", "Pump_Frequency", "Energy_kWh"]
 FEATURES = ["Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"]
 
+# Common industrial naming variants. Unknown columns (e.g. GR, RHOB, NPHI, resistivity)
+# are intentionally ignored by the production dashboard rather than fed into its models.
+COLUMN_ALIASES = {
+    "Date": ["date", "datetime", "timestamp", "time", "sample_date", "observation_date", "production_date"],
+    "Well": ["well", "well_id", "well name", "well_name", "wellno", "well_no", "uwi", "api", "well identifier"],
+    "Oil_Rate": ["oil_rate", "oil rate", "oil production", "oil production rate", "qo", "oil_volumetric_rate", "oil_m3_d", "oil rate (m3/d)", "oil rate (m³/d)"],
+    "Water_Rate": ["water_rate", "water rate", "water production", "water production rate", "qw", "water_volumetric_rate", "water_m3_d", "water rate (m3/d)", "water rate (m³/d)"],
+    "Gas_Rate": ["gas_rate", "gas rate", "gas production", "gas production rate", "qg", "gas_mscf_d", "gas rate (mcf/d)"],
+    "Wellhead_Pressure": ["wellhead_pressure", "wellhead pressure", "whp", "tubing_head_pressure", "thp", "well head pressure"],
+    "Bottomhole_Pressure": ["bottomhole_pressure", "bottom hole pressure", "bhp", "flowing_bottomhole_pressure", "fbhp", "bottom-hole pressure"],
+    "Injection_Rate": ["injection_rate", "injection rate", "injection", "gas_lift_rate", "gas lift rate", "lift_gas_rate", "lift gas rate", "water_injection_rate", "qinj"],
+    "Pump_Vibration": ["pump_vibration", "vibration", "vibration_rms", "pump vibration"],
+    "Motor_Temperature": ["motor_temperature", "motor temp", "motor_temperature_c", "motor temperature", "motor_temp"],
+    "Motor_Current": ["motor_current", "current", "motor amps", "motor_current_a", "motor current"],
+    "Pump_Frequency": ["pump_frequency", "frequency", "vfd_frequency", "pump frequency", "frequency_hz"],
+    "Energy_kWh": ["energy_kwh", "energy", "energy_kwh", "power_consumption_kwh", "energy consumed", "energy consumption"]
+}
+
+def _key(name):
+    return " ".join(str(name).strip().lower().replace("_", " ").replace("-", " ").split())
+
+def map_industrial_columns(raw):
+    """Map recognised source headers to FIELDWISE names; discard unneeded columns."""
+    df = raw.copy()
+    aliases = {_key(alias): canonical for canonical, names in COLUMN_ALIASES.items() for alias in [canonical, *names]}
+    rename = {}
+    mapped = {}
+    for col in df.columns:
+        canonical = aliases.get(_key(col))
+        if canonical and canonical not in mapped:
+            rename[col] = canonical
+            mapped[canonical] = col
+    df = df.rename(columns=rename)
+    selected = [c for c in REQUIRED_COLUMNS + OPTIONAL_SENSOR_COLUMNS if c in df.columns]
+    ignored = [str(c) for c in raw.columns if c not in mapped.values()]
+    return df[selected].copy(), mapped, ignored
+
+def clean_industrial_data(raw):
+    """Conservative, auditable cleanup. Does not invent missing production targets."""
+    frame, mapped, ignored = map_industrial_columns(raw)
+    report = {"input_rows": len(raw), "mapped_columns": mapped, "ignored_columns": ignored, "duplicates_removed": 0,
+              "rows_without_date_or_well_removed": 0, "invalid_negative_rates_removed": 0,
+              "numeric_values_imputed": 0, "outlier_values_capped": 0, "notes": []}
+    missing = [c for c in REQUIRED_COLUMNS if c not in frame.columns]
+    if missing:
+        report["missing_required"] = missing
+        return None, report
+    # Parse mixed date formats; unparseable timestamps are removed and reported.
+    try:
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce", format="mixed", dayfirst=False)
+    except (TypeError, ValueError):
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame["Well"] = frame["Well"].astype("string").str.strip().str.upper()
+    frame["Well"] = frame["Well"].replace({"": pd.NA, "NAN": pd.NA, "NONE": pd.NA, "<NA>": pd.NA})
+    before = len(frame)
+    frame = frame.dropna(subset=["Date", "Well"]).copy()
+    report["rows_without_date_or_well_removed"] = before - len(frame)
+    before = len(frame)
+    frame = frame.drop_duplicates().copy()
+    report["duplicates_removed"] = before - len(frame)
+    numeric = [c for c in NUMERIC_COLUMNS + OPTIONAL_SENSOR_COLUMNS if c in frame.columns]
+    for col in numeric:
+        original_nonmissing = frame[col].notna().sum()
+        frame[col] = pd.to_numeric(frame[col].astype(str).str.replace(",", "", regex=False).str.strip().replace({"": np.nan, "N/A": np.nan, "NA": np.nan, "unknown": np.nan, "—": np.nan, "-": np.nan}), errors="coerce")
+        frame[col] = frame[col].replace([np.inf, -np.inf], np.nan)
+        report["numeric_values_imputed"] += int(frame[col].isna().sum())
+    # Negative production/injection rates are invalid for this use case; treat as missing, not zero.
+    for col in [c for c in ["Oil_Rate", "Water_Rate", "Gas_Rate", "Injection_Rate"] if c in frame.columns]:
+        mask = frame[col] < 0
+        report["invalid_negative_rates_removed"] += int(mask.sum())
+        frame.loc[mask, col] = np.nan
+    frame = frame.sort_values(["Well", "Date"]).reset_index(drop=True)
+    # Fill gaps within each well using time-series interpolation, then the field median.
+    for col in numeric:
+        missing_before = int(frame[col].isna().sum())
+        frame[col] = frame.groupby("Well", group_keys=False)[col].transform(lambda x: x.interpolate(limit_direction="both"))
+        if frame[col].isna().any():
+            median = frame[col].median()
+            if pd.notna(median):
+                frame[col] = frame[col].fillna(median)
+        report["numeric_values_imputed"] += max(0, int(frame[col].isna().sum()) - missing_before)
+    # Cap statistical extremes with 1.5*IQR fences; keep the count transparent.
+    # This is a generic safeguard, not a substitute for physical operating limits.
+    for col in numeric:
+        q1, q3 = frame[col].quantile([0.25, 0.75]) if frame[col].notna().any() else (np.nan, np.nan)
+        if pd.notna(q1) and pd.notna(q3) and q3 > q1:
+            iqr = q3 - q1
+            lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
+            mask = (frame[col] < lo) | (frame[col] > hi)
+            report["outlier_values_capped"] += int(mask.sum())
+            frame[col] = frame[col].clip(lo, hi)
+    frame = frame.dropna(subset=["Oil_Rate", "Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate"])
+    if len(frame) < 20:
+        report["error"] = f"Only {len(frame)} usable rows remain after cleaning; at least 20 are needed."
+        return None, report
+    if frame["Date"].nunique() < 2:
+        report["error"] = "At least two distinct dates are required for chronological validation."
+        return None, report
+    report["output_rows"] = len(frame)
+    report["rows_removed_total"] = len(raw) - len(frame)
+    report["notes"].append("Unrecognised columns were ignored; no missing oil/water/gas/pressure/injection targets were fabricated.")
+    report["notes"].append("Missing numeric values were interpolated within each well where possible, then filled with the field median.")
+    report["notes"].append("Statistical outliers were capped at 1.5×IQR fences. Review these values with engineering limits before operational use.")
+    return frame.reset_index(drop=True), report
+
 # ---------- Styling ----------
 st.markdown("""
 <style>
@@ -74,9 +179,8 @@ def make_demo_data():
     cols = REQUIRED_COLUMNS + OPTIONAL_SENSOR_COLUMNS
     return pd.DataFrame(rows, columns=cols)
 
-# ---------- Upload and validation ----------
-st.sidebar.markdown("## FIELDWISE AI")
-st.sidebar.caption("Production optimisation & equipment intelligence")
+# ---------- Upload, column selection and automatic cleaning ----------
+st.sidebar.markdown("### Data ingestion")
 template = pd.DataFrame({
     "Date": ["2026-01-01", "2026-01-02"], "Well": ["W-001", "W-001"],
     "Oil_Rate": [85.0, 84.2], "Water_Rate": [74.0, 75.0], "Gas_Rate": [62.0, 61.5],
@@ -85,7 +189,7 @@ template = pd.DataFrame({
     "Pump_Frequency": [48.0, 48.0], "Energy_kWh": [390.0, 388.0]
 })
 st.sidebar.download_button("Download CSV template", template.to_csv(index=False).encode(), file_name="fieldwise_operations_template.csv", mime="text/csv", use_container_width=True)
-uploaded_file = st.sidebar.file_uploader("Upload field data (CSV)", type=["csv"], help="Required production columns plus optional equipment sensor columns.")
+uploaded_file = st.sidebar.file_uploader("Upload industrial CSV", type=["csv"], help="Messy headers and extra columns are allowed. The app maps known aliases and selects only relevant production/sensor columns.")
 
 @st.cache_data
 def load_uploaded(file_bytes):
@@ -93,35 +197,27 @@ def load_uploaded(file_bytes):
 
 source = "Built-in illustrative dataset"
 upload_error = None
+cleaning_report = None
+raw_upload_preview = None
 df = make_demo_data()
 if uploaded_file is not None:
     try:
-        raw = pd.read_csv(uploaded_file)
-        missing = [c for c in REQUIRED_COLUMNS if c not in raw.columns]
-        if missing:
-            raise ValueError("Missing required columns: " + ", ".join(missing))
-        keep = REQUIRED_COLUMNS + [c for c in OPTIONAL_SENSOR_COLUMNS if c in raw.columns]
-        raw = raw[keep].copy()
-        raw["Date"] = pd.to_datetime(raw["Date"], errors="coerce")
-        raw["Well"] = raw["Well"].astype(str).str.strip()
-        for c in keep:
-            if c not in ("Date", "Well"):
-                raw[c] = pd.to_numeric(raw[c], errors="coerce")
-        raw = raw.replace([np.inf, -np.inf], np.nan)
-        if raw[keep].isna().any().any():
-            raise ValueError("Required or supplied optional columns contain blank/non-numeric values. Clean the file and upload again.")
-        if len(raw) < 20:
-            raise ValueError("Please upload at least 20 valid historical rows.")
-        if raw["Date"].nunique() < 2:
-            raise ValueError("The dataset must contain at least two distinct dates.")
-        if (raw[["Oil_Rate", "Water_Rate", "Injection_Rate"]] < 0).any().any():
-            raise ValueError("Oil, water and injection rates must be non-negative.")
-        # Create optional sensor fields only if the uploaded data does not contain them.
+        raw_upload_preview = pd.read_csv(uploaded_file)
+        cleaned, cleaning_report = clean_industrial_data(raw_upload_preview)
+        if cleaned is None:
+            missing = cleaning_report.get("missing_required", [])
+            if missing:
+                raise ValueError("Could not identify required operational fields: " + ", ".join(missing) + ". This appears to be a well-log/reservoir dataset or uses unrecognised headers. A production optimisation run needs date, well ID, oil rate, water rate, gas rate, wellhead pressure, bottomhole pressure and injection/lift-gas rate. Extra log curves such as GR, RHOB, NPHI and resistivity will be ignored.")
+            raise ValueError(cleaning_report.get("error", "Data could not be cleaned."))
+        # Equipment placeholder values are added only when real sensor columns are absent.
+        synthetic_sensor_columns = []
         rng = np.random.default_rng(7)
         for c, base, spread in [("Pump_Vibration", 2.0, .25), ("Motor_Temperature", 72.0, 2.0), ("Motor_Current", 50.0, 4.0), ("Pump_Frequency", 48.0, 1.5), ("Energy_kWh", 380.0, 15.0)]:
-            if c not in raw.columns:
-                raw[c] = np.maximum(0, rng.normal(base, spread, len(raw)))
-        df = raw.sort_values(["Date", "Well"]).reset_index(drop=True)
+            if c not in cleaned.columns:
+                cleaned[c] = np.maximum(0, rng.normal(base, spread, len(cleaned)))
+                synthetic_sensor_columns.append(c)
+        cleaning_report["synthetic_sensor_columns"] = synthetic_sensor_columns
+        df = cleaned.sort_values(["Date", "Well"]).reset_index(drop=True)
         source = f"User-uploaded data · {uploaded_file.name}"
     except Exception as e:
         upload_error = str(e)
@@ -175,7 +271,7 @@ def kpi(label, value, sub=""):
 def section(title, kicker=""):
     st.markdown(f'<div class="section-kicker">{kicker}</div><h2 class="section-title">{title}</h2>', unsafe_allow_html=True)
 
-page = st.sidebar.radio("Navigation", ["Command Centre", "Data Input", "Well Intelligence", "Equipment Health", "Production Optimisation", "Field Analytics", "Explainable AI", "Methodology"])
+page = st.sidebar.radio("Navigation", ["Command Centre", "Data Input", "Data Cleaning", "Well Intelligence", "Equipment Health", "Production Optimisation", "Field Analytics", "Explainable AI", "Methodology"])
 st.sidebar.markdown('<div style="margin-top:28px;padding-top:10px;border-top:1px solid #20323d;color:#6F858F;font-size:11px;letter-spacing:.5px;text-align:center;">designed by Kavinkarthick</div>', unsafe_allow_html=True)
 
 st.markdown('''<div class="hero"><div class="brand">FIELDWISE AI</div><span class="badge">MATURE FIELD OPERATIONS INTELLIGENCE</span><h1>Optimise production. Anticipate equipment issues.</h1><p>An AI-assisted decision-support prototype combining well surveillance, equipment anomaly screening and multi-well operating-scenario comparison for mature oil and gas fields.</p></div>''', unsafe_allow_html=True)
@@ -225,8 +321,8 @@ if page == "Command Centre":
 elif page == "Data Input":
     section("Bring Your Field Data", "DATA IMPORT")
     if upload_error: st.error(upload_error)
-    elif source.startswith("User-uploaded"): st.success(f"Successfully loaded {uploaded_file.name}; accepted data power the dashboard and oil-rate proxy model.")
-    else: st.info("Upload a CSV from the sidebar. Required columns cover well production, pressure and injection. Sensor columns are optional but enable more meaningful equipment screening.")
+    elif source.startswith("User-uploaded"): st.success(f"Mapped, cleaned and loaded {uploaded_file.name}; the selected operational columns power the dashboard and oil-rate proxy model.")
+    else: st.info("Upload an industrial CSV from the sidebar. Known aliases are mapped automatically, relevant columns are selected, and common data-quality issues are cleaned before modelling.")
     a,b,c = st.columns(3)
     with a: kpi("Rows loaded", f"{len(df):,}", "well-date observations")
     with b: kpi("Wells", f"{df['Well'].nunique()}", "unique well IDs")
@@ -237,10 +333,49 @@ elif page == "Data Input":
     st.markdown("### Optional equipment columns")
     opt_desc = ["Pump vibration measurement","Motor temperature","Motor current","Pump operating frequency","Energy consumed over the observation interval"]
     st.dataframe(pd.DataFrame({"Column":OPTIONAL_SENSOR_COLUMNS,"Meaning":opt_desc}), hide_index=True, use_container_width=True)
-    st.caption("One row should represent one well at one timestamp. Optional sensor columns are important for equipment monitoring. If omitted, the prototype fills them with illustrative values; those generated values must not be interpreted as real equipment evidence.")
+    st.caption("One row should represent one well at one timestamp. Extra columns such as resistivity and gamma ray are ignored by this production workflow. Missing sensor columns are filled with synthetic placeholders for the demo only—not real equipment evidence.")
     st.markdown("### Data preview")
     st.dataframe(df.head(25), hide_index=True, use_container_width=True)
     st.download_button("Download currently loaded data", df.to_csv(index=False).encode(), file_name="fieldwise_loaded_data.csv", mime="text/csv")
+
+# ---------- Data Cleaning ----------
+elif page == "Data Cleaning":
+    section("Automatic Data Cleaning & Column Selection", "INGESTION QUALITY GATE")
+    st.write("FIELDWISE AI first recognises common industrial header variants, selects the production and sensor fields it understands, and ignores unrelated columns. It then parses dates, standardises well IDs, converts numeric fields, removes exact duplicates and unusable timestamps, handles missing values, and caps statistical outliers using 1.5×IQR fences.")
+    if upload_error:
+        st.error(upload_error)
+        st.info("A pure well-log file containing only depth, gamma ray, resistivity, density or porosity cannot run the production optimiser by itself. Those curves can be stored for a separate reservoir-characterisation module, but production optimisation needs dated well operating data.")
+    elif cleaning_report and source.startswith("User-uploaded"):
+        c1,c2,c3,c4 = st.columns(4)
+        with c1: kpi("Input rows", f"{cleaning_report.get('input_rows', 0):,}", "before cleaning")
+        with c2: kpi("Rows loaded", f"{len(df):,}", "after cleaning")
+        with c3: kpi("Duplicate rows removed", f"{cleaning_report.get('duplicates_removed', 0):,}", "exact duplicates")
+        with c4: kpi("Outlier values capped", f"{cleaning_report.get('outlier_values_capped', 0):,}", "1.5×IQR fences")
+        st.markdown("### Column mapping")
+        mapping = cleaning_report.get("mapped_columns", {})
+        if mapping:
+            st.dataframe(pd.DataFrame([{"FIELDWISE field": k, "Source column": v} for k,v in mapping.items()]), hide_index=True, use_container_width=True)
+        st.markdown("### Ignored columns")
+        ignored = cleaning_report.get("ignored_columns", [])
+        if ignored:
+            st.write(", ".join(ignored))
+        else:
+            st.write("No extra columns were ignored.")
+        st.markdown("### Cleaning actions")
+        st.write(f"- Rows removed for missing/unparseable date or well ID: **{cleaning_report.get('rows_without_date_or_well_removed', 0)}**")
+        st.write(f"- Negative rate values treated as missing: **{cleaning_report.get('invalid_negative_rates_removed', 0)}**")
+        st.write(f"- Numeric values imputed/remaining missing-value handling count: **{cleaning_report.get('numeric_values_imputed', 0)}**")
+        for note in cleaning_report.get("notes", []): st.caption("• " + note)
+        synthetic = cleaning_report.get("synthetic_sensor_columns", [])
+        if synthetic:
+            st.warning("No real data supplied for these equipment fields; demo placeholders were generated: " + ", ".join(synthetic) + ". Do not interpret their alerts as evidence of equipment condition.")
+        st.markdown("### Cleaned data preview")
+        st.dataframe(df.head(30), hide_index=True, use_container_width=True)
+        st.download_button("Download cleaned and selected CSV", df.to_csv(index=False).encode("utf-8"), file_name="fieldwise_cleaned_selected_data.csv", mime="text/csv", use_container_width=True)
+    else:
+        st.info("Upload a CSV in the sidebar to view the column mapping, cleaning report, and downloadable cleaned dataset. The built-in demo dataset is currently active.")
+    st.markdown("### What this system does not do")
+    st.caption("It does not infer missing oil production from resistivity or gamma ray, does not convert unknown units automatically, and does not prove that a statistical outlier is an equipment fault. Confirm unit conventions and any capped values with a petroleum engineer before operational use.")
 
 # ---------- Well Intelligence ----------
 elif page == "Well Intelligence":
@@ -382,8 +517,8 @@ elif page == "Explainable AI":
 elif page == "Methodology":
     section("How FIELDWISE AI Works", "TECHNICAL ARCHITECTURE")
     steps=[
-        ("01","Field data ingestion","Load production, pressure, injection and optional artificial-lift sensor data."),
-        ("02","Data validation","Check required columns, timestamps, numeric values and consistent units."),
+        ("01","Industrial data ingestion","Recognise common header aliases, select required operational/sensor columns and ignore unrelated log curves."),
+        ("02","Automatic data cleaning","Parse dates, standardise well IDs, remove exact duplicates, impute missing numeric values and cap statistical outliers for engineer review."),
         ("03","Production proxy model","Random Forest estimates oil rate from available well operating variables."),
         ("04","Equipment anomaly screening","Isolation Forest flags unusual combinations of vibration, temperature, current, frequency and energy indicators."),
         ("05","Multi-well scenario evaluation","Compare alternative allocations under a user-defined total resource limit."),
