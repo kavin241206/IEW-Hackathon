@@ -20,9 +20,13 @@ Internal units: liquids m³/d · gas Sm³/d · pressure bar · choke size 1/64 i
 """
 from __future__ import annotations
 
+import ast
+import builtins
+import difflib
 import hashlib
 import html
 import io
+import os
 import re
 from dataclasses import astuple, dataclass
 
@@ -47,6 +51,10 @@ SENSOR_COLUMNS = ["Pump_Vibration", "Motor_Temperature", "Motor_Current", "Pump_
 OPTIONAL_COLUMNS = ["Choke_Size"] + SENSOR_COLUMNS
 CORE_NUMERIC = CORE_COLUMNS[2:]
 NUMERIC_COLUMNS = CORE_NUMERIC + OPTIONAL_COLUMNS
+REQUIRED = ["Date", "Well", "Oil_Rate"]          # everything else is optional or derived
+# Helper fields: not used directly, but let FIELDWISE derive missing rates (e.g. water from water cut)
+AUX_COLUMNS = ["Water_Cut", "Liquid_Rate", "GOR"]
+ALL_FIELDS = CORE_COLUMNS + OPTIONAL_COLUMNS + AUX_COLUMNS
 RATE_COLUMNS = ["Oil_Rate", "Water_Rate", "Gas_Rate", "Injection_Rate"]
 PRESSURE_COLUMNS = ["Wellhead_Pressure", "Bottomhole_Pressure"]
 SETPOINTS = ["Choke_Size"]   # changed in steps: carried forward, never interpolated or capped
@@ -58,6 +66,9 @@ DESCRIPTIONS = {
     "Injection_Rate": "Lift-gas (or injection) rate", "Choke_Size": "Production choke (bean) size",
     "Pump_Vibration": "Pump vibration", "Motor_Temperature": "Motor temperature", "Motor_Current": "Motor current",
     "Pump_Frequency": "VFD / pump frequency", "Energy_kWh": "Energy used in the interval",
+    "Water_Cut": "Water cut / BS&W (% or fraction) — used to derive missing rates",
+    "Liquid_Rate": "Gross liquid rate — used to derive missing oil or water",
+    "GOR": "Gas-oil ratio — used to derive a missing gas rate",
 }
 
 ALIASES = {
@@ -80,6 +91,10 @@ ALIASES = {
     "Motor_Current": ["motor current", "current", "motor amps", "motor current a"],
     "Pump_Frequency": ["pump frequency", "frequency", "vfd frequency", "frequency hz"],
     "Energy_kWh": ["energy kwh", "energy", "power consumption kwh", "energy consumed", "energy consumption"],
+    "Water_Cut": ["water cut", "watercut", "wc", "bsw", "bs&w", "bs and w", "water cut %", "water cut (%)"],
+    "Liquid_Rate": ["liquid rate", "liquid", "gross rate", "gross liquid", "total liquid", "gross fluid", "ql",
+                    "fluid rate", "total fluid", "blpd"],
+    "GOR": ["gor", "gas oil ratio", "gas/oil ratio", "gas-oil ratio"],
 }
 
 _LIQ = {"m³/d": 1.0, "bbl/d": 0.1589872949, "STB/d": 0.1589872949, "m³/h": 24.0, "L/s": 86.4, "L/min": 1.44}
@@ -92,11 +107,13 @@ UNITS = {  # standard = source × factor (°F also gets an offset)
     "Motor_Temperature": {"°C": 1.0, "°F": 5.0 / 9.0}, "Motor_Current": {"A": 1.0, "mA": 0.001},
     "Pump_Frequency": {"Hz": 1.0, "rpm": 1.0 / 60.0}, "Pump_Vibration": {"mm/s": 1.0, "in/s": 25.4},
     "Energy_kWh": {"kWh": 1.0, "Wh": 0.001, "MWh": 1000.0},
+    "Liquid_Rate": _LIQ,
+    "GOR": {"Sm³/m³": 1.0, "scf/bbl": 0.178108, "Mscf/bbl": 178.108},
 }
 STD_UNIT = {"Oil_Rate": "m³/d", "Water_Rate": "m³/d", "Gas_Rate": "Sm³/d", "Injection_Rate": "Sm³/d",
             "Wellhead_Pressure": "bar", "Bottomhole_Pressure": "bar", "Choke_Size": "1/64 in",
             "Motor_Temperature": "°C", "Motor_Current": "A", "Pump_Frequency": "Hz", "Pump_Vibration": "mm/s",
-            "Energy_kWh": "kWh"}
+            "Energy_kWh": "kWh", "Liquid_Rate": "m³/d", "GOR": "Sm³/m³"}
 MISSING = {"", "nan", "none", "null", "n/a", "na", "unknown", "—", "-", "<na>", "#n/a", "nat"}
 M3_TO_BBL = 6.289811
 GRID_CO2 = 0.71   # kg CO2 per kWh — Indian grid average; adjustable in Settings
@@ -122,7 +139,9 @@ def _strip_units(name) -> str:
 _LOOKUP = {_norm(a): canon for canon, names in ALIASES.items() for a in [canon, *names]}
 # Keyword fallback for headers no alias list anticipated (first match wins, most specific first)
 _KEYWORDS = [
-    ("Choke_Size", ("choke", "bean")), ("Injection_Rate", ("lift gas", "gas lift", "injection", "glir")),
+    ("Water_Cut", ("water cut", "watercut", "bsw", "bs&w")), ("GOR", ("gas oil ratio", "gas/oil", "gor")),
+    ("Liquid_Rate", ("liquid", "gross", "total fluid", "blpd")),
+    ("Choke_Size", ("choke", "bean")), ("Injection_Rate", ("lift gas", "gas lift", "injection", "glir", "gl inj", "inj rate", "gl rate", "inj")),
     ("Bottomhole_Pressure", ("bottom hole", "bottomhole", "bhp", "downhole press", "pwf")),
     ("Wellhead_Pressure", ("wellhead", "well head", "tubing head", "thp", "whp")),
     ("Pump_Vibration", ("vibration",)), ("Motor_Temperature", ("motor temp", "winding temp")),
@@ -133,6 +152,7 @@ _KEYWORDS = [
 ]
 # Unit hints found in header text → unit option
 _UNIT_HINTS = [
+    (r"scf\s*/\s*(bbl|stb)", "scf/bbl"), (r"sm3\s*/\s*sm3|sm³\s*/\s*sm³|m3\s*/\s*m3|m³\s*/\s*m³", "Sm³/m³"),
     (r"\bmmscf", "MMSCFD"), (r"\bmscf|\bmcf", "Mscf/d"), (r"\bscf", "scf/d"), (r"nm3|nm³", "Nm³/h"),
     (r"\bbopd|\bbwpd|\bbbl|\bstb", "bbl/d"), (r"m3\s*/\s*h|m³\s*/\s*h", "m³/h"), (r"\bl\s*/\s*s\b", "L/s"),
     (r"\bpsi", "psi"), (r"\bkpa", "kPa"), (r"\bmpa", "MPa"), (r"kgf|kg\s*/\s*cm", "kgf/cm²"), (r"\bbar", "bar"),
@@ -152,23 +172,79 @@ def detect_unit(header: str, field: str):
     return None
 
 
-def map_columns(raw: pd.DataFrame):
-    """Return (frame with FIELDWISE columns, {field: source header}, ignored headers)."""
-    rename, mapped = {}, {}
-    for col in raw.columns:                         # 1) exact alias, with or without unit text
+def infer_columns(raw: pd.DataFrame):
+    """Work out what each column means from its NAME and its VALUES.
+    Returns ({field: source column}, {field: how it was recognised})."""
+    cols = [c for c in raw.columns if str(c).strip() and not str(c).lower().startswith("unnamed")]
+    mapped, how, used = {}, {}, set()
+
+    def take(field, col, reason):
+        mapped[field], how[field] = str(col), reason
+        used.add(col)
+
+    for col in cols:                                    # 1) known names, with or without unit text
         canon = _LOOKUP.get(_norm(col)) or _LOOKUP.get(_strip_units(col))
-        if canon and canon not in mapped:
-            rename[col], mapped[canon] = canon, str(col)
-    for canon, words in _KEYWORDS:                  # 2) keyword fallback, only if unambiguous
+        if canon and canon not in mapped and col not in used:
+            take(canon, col, "known name")
+    for canon, words in _KEYWORDS:                      # 2) keywords inside longer headers (if unambiguous)
         if canon in mapped:
             continue
-        hits = [c for c in raw.columns if c not in rename and any(w in _strip_units(c) for w in words)
-                and not ("ratio" in _norm(c) or "cut" in _norm(c) or "cum" in _norm(c).split())]
+        hits = [c for c in cols if c not in used and any(w in _strip_units(c) for w in words)
+                and (canon in AUX_COLUMNS or not ("ratio" in _norm(c) or "cut" in _norm(c) or "cum" in _norm(c).split()))]
         if len(hits) == 1:
-            rename[hits[0]], mapped[canon] = canon, str(hits[0])
-    frame = raw.rename(columns=rename)
-    keep = [c for c in CORE_COLUMNS + OPTIONAL_COLUMNS if c in frame.columns]
-    return frame[keep].copy(), mapped, [str(c) for c in raw.columns if c not in rename]
+            take(canon, hits[0], "keyword in header")
+    names = {_strip_units(a): canon for canon, al in ALIASES.items() for a in [canon, *al] if len(_strip_units(a)) > 3}
+    for col in cols:                                    # 3) similar spelling (typos, abbreviations)
+        if col in used:
+            continue
+        best = difflib.get_close_matches(_strip_units(col), list(names), n=1, cutoff=0.82)
+        if best and names[best[0]] not in mapped:
+            take(names[best[0]], col, f"similar to '{best[0]}'")
+    sample = raw.head(300)
+    if "Date" not in mapped:                            # 4) content: a column whose values are dates
+        for col in cols:
+            if col in used:
+                continue
+            v = sample[col].dropna()
+            if len(v) and not pd.api.types.is_numeric_dtype(v):
+                ok = pd.to_datetime(v.astype(str), errors="coerce", format="mixed").notna().mean()
+                if ok > 0.9:
+                    take("Date", col, "values look like dates")
+                    break
+            elif pd.api.types.is_datetime64_any_dtype(v):
+                take("Date", col, "values are dates")
+                break
+    if "Well" not in mapped:                            # 5) content: repeating text labels = well IDs
+        best, score = None, 0
+        for col in cols:
+            if col in used:
+                continue
+            v = raw[col].dropna()
+            if len(v) == 0 or pd.api.types.is_numeric_dtype(v) or pd.api.types.is_datetime64_any_dtype(v):
+                continue
+            n = v.nunique()
+            if 1 <= n <= max(2, len(v) // 3):
+                sc = 1 - n / len(v) + (0.5 if v.astype(str).str.contains(r"\d").mean() > 0.8 else 0)
+                if sc > score:
+                    best, score = col, sc
+        if best is not None:
+            take("Well", best, "repeating labels look like well IDs")
+    return mapped, how
+
+
+def map_columns(raw: pd.DataFrame, mapping: dict | None = None):
+    """Rename to FIELDWISE fields. `mapping` ({field: source column}) overrides automatic recognition.
+    Returns (frame, {field: source header}, ignored headers)."""
+    if mapping is None:
+        mapping, _ = infer_columns(raw)
+    lookup = {str(c): c for c in raw.columns}
+    rename, mapped = {}, {}
+    for field, src in mapping.items():
+        if src is not None and str(src) in lookup and lookup[str(src)] not in rename:
+            rename[lookup[str(src)]] = field
+            mapped[field] = str(src)
+    frame = raw[list(rename)].rename(columns=rename).copy()
+    return frame, mapped, [str(c) for c in raw.columns if c not in rename]
 
 
 def _to_number(s: pd.Series) -> pd.Series:
@@ -177,16 +253,40 @@ def _to_number(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").astype(float).replace([np.inf, -np.inf], np.nan)
 
 
-def clean_data(raw: pd.DataFrame, unit_choices: dict):
-    """Auditable cleaning. Returns (clean frame | None, report)."""
-    frame, mapped, ignored = map_columns(raw)
+def derive_fields(frame: pd.DataFrame, rep: dict) -> pd.DataFrame:
+    """Use petroleum relationships to fill fields the file does not contain directly."""
+    has = lambda c: c in frame.columns and frame[c].notna().any()  # noqa: E731
+    if has("Water_Cut"):
+        wc = frame["Water_Cut"]
+        frame["Water_Cut"] = np.where(wc.max() <= 1.0, wc, wc / 100.0)   # % or fraction
+        frame["Water_Cut"] = frame["Water_Cut"].clip(0, 0.999)
+    if not has("Oil_Rate") and has("Liquid_Rate") and has("Water_Cut"):
+        frame["Oil_Rate"] = frame["Liquid_Rate"] * (1 - frame["Water_Cut"])
+        rep["derived"].append("Oil rate = liquid rate × (1 − water cut)")
+    if not has("Oil_Rate") and has("Liquid_Rate") and has("Water_Rate"):
+        frame["Oil_Rate"] = (frame["Liquid_Rate"] - frame["Water_Rate"]).clip(lower=0)
+        rep["derived"].append("Oil rate = liquid rate − water rate")
+    if not has("Water_Rate") and has("Oil_Rate"):
+        if has("Water_Cut"):
+            frame["Water_Rate"] = frame["Oil_Rate"] * frame["Water_Cut"] / (1 - frame["Water_Cut"])
+            rep["derived"].append("Water rate = oil rate × WC / (1 − WC)")
+        elif has("Liquid_Rate"):
+            frame["Water_Rate"] = (frame["Liquid_Rate"] - frame["Oil_Rate"]).clip(lower=0)
+            rep["derived"].append("Water rate = liquid rate − oil rate")
+    if not has("Gas_Rate") and has("Oil_Rate") and has("GOR"):
+        frame["Gas_Rate"] = frame["Oil_Rate"] * frame["GOR"]
+        rep["derived"].append("Gas rate = oil rate × GOR")
+    return frame.drop(columns=[c for c in AUX_COLUMNS if c in frame.columns])
+
+
+def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = None):
+    """Auditable cleaning. Only Date, Well and Oil rate are strictly required (oil may be derived).
+    Returns (clean frame | None, report)."""
+    frame, mapped, ignored = map_columns(raw, mapping)
     rep = {"input_rows": len(raw), "mapped": mapped, "ignored": ignored, "bad_keys": 0, "duplicates": 0,
            "invalid": 0, "imputed": {}, "capped": 0, "dropped_optional": [], "conversions": [],
-           "injection_missing": False}
-    if "Injection_Rate" not in frame.columns:
-        frame["Injection_Rate"] = 0.0
-        rep["injection_missing"] = True
-    missing = [c for c in CORE_COLUMNS if c not in frame.columns]
+           "injection_missing": False, "derived": [], "absent": []}
+    missing = [c for c in ["Date", "Well"] if c not in frame.columns]
     if missing:
         rep["missing"] = missing
         return None, rep
@@ -201,11 +301,8 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
     frame = frame.dropna(subset=["Date", "Well"])
     rep["bad_keys"] = n0 - len(frame)
 
-    numeric = [c for c in NUMERIC_COLUMNS if c in frame.columns]
-    miss_frac = {}
-    for col in numeric:
+    for col in [c for c in NUMERIC_COLUMNS + AUX_COLUMNS if c in frame.columns]:
         frame[col] = _to_number(frame[col])
-        miss_frac[col] = float(frame[col].isna().mean())
 
     for col, unit in unit_choices.items():
         if col not in frame.columns or unit not in UNITS.get(col, {}):
@@ -216,6 +313,21 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
         offset = -32.0 * 5.0 / 9.0 if unit == "°F" else 0.0
         frame[col] = frame[col] * UNITS[col][unit] + offset
         rep["conversions"].append({"Field": col, "From": unit, "To": target})
+
+    frame = derive_fields(frame, rep)
+    if "Oil_Rate" not in frame.columns or frame["Oil_Rate"].isna().all():
+        rep["missing"] = ["Oil_Rate"]
+        return None, rep
+    # Optional measurements that are absent: water/gas → 0 (stated), pressures → left empty (models skip them)
+    for col in ["Water_Rate", "Gas_Rate"]:
+        if col not in frame.columns:
+            frame[col] = 0.0
+            rep["absent"].append(col)
+    if "Injection_Rate" not in frame.columns:
+        frame["Injection_Rate"] = 0.0
+        rep["injection_missing"] = True
+    numeric = [c for c in NUMERIC_COLUMNS if c in frame.columns]
+    miss_frac = {c: float(frame[c].isna().mean()) for c in numeric}
 
     for col in [c for c in RATE_COLUMNS + PRESSURE_COLUMNS + SETPOINTS if c in frame.columns]:
         bad = frame[col] < 0
@@ -254,7 +366,7 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
             span = (next_p - prev_p).replace(0, np.nan)
             interp = prev_v + (next_v - prev_v) * (pos - prev_p) / span
             frame[col] = frame[col].fillna(interp).fillna(prev_v).fillna(next_v)
-            if col in CORE_NUMERIC:
+            if col in CORE_NUMERIC and frame[col].notna().any():
                 frame[col] = frame[col].fillna(frame[col].median())
         rep["imputed"][col] = n_miss - int(frame[col].isna().sum())
 
@@ -275,7 +387,11 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
         rep["capped"] = int(out.sum())
         frame[cap_cols] = np.where(out, np.clip(vals, lo, hi), vals)
 
-    frame = frame.dropna(subset=CORE_NUMERIC).reset_index(drop=True)
+    for col in PRESSURE_COLUMNS:                     # absent pressures: explicit empty columns
+        if col not in frame.columns:
+            frame[col] = np.nan
+            rep["absent"].append(col)
+    frame = frame.dropna(subset=["Oil_Rate"]).reset_index(drop=True)
     if len(frame) < 30:
         rep["error"] = f"Only {len(frame)} usable rows after cleaning — at least 30 are needed."
         return None, rep
@@ -332,8 +448,8 @@ def read_file(key: str, _data: bytes, name: str) -> dict:
 
 
 @st.cache_resource(show_spinner=False, max_entries=3)
-def clean_cached(key: str, _sheets: dict, sheet: str, units: tuple):
-    return clean_data(_sheets[sheet], dict(units))
+def clean_cached(key: str, _sheets: dict, sheet: str, units: tuple, mapping: tuple):
+    return clean_data(_sheets[sheet], dict(units), dict(mapping))
 
 
 def template_frame() -> pd.DataFrame:
@@ -346,9 +462,10 @@ def template_frame() -> pd.DataFrame:
 
 
 def schema_frame() -> pd.DataFrame:
-    return pd.DataFrame([{"Column": c, "Needed": "Required" if c in CORE_COLUMNS else "Optional",
-                          "Unit": STD_UNIT.get(c, "—"), "Meaning": DESCRIPTIONS[c]}
-                         for c in CORE_COLUMNS + OPTIONAL_COLUMNS])
+    return pd.DataFrame([{"Column": c,
+                          "Needed": "Required" if c in REQUIRED else "Recommended" if c in CORE_COLUMNS else "Optional",
+                          "Unit": STD_UNIT.get(c, "% or fraction" if c == "Water_Cut" else "—"), "Meaning": DESCRIPTIONS[c]}
+                         for c in CORE_COLUMNS + OPTIONAL_COLUMNS + AUX_COLUMNS])
 
 
 @st.cache_data(show_spinner=False)
@@ -371,6 +488,7 @@ class Field:
     report: dict
     lift_is_gas: bool
     key: str = ""
+    raw: pd.DataFrame | None = None      # the sheet exactly as uploaded (all columns) — used by Ask FIELDWISE
 
     @property
     def sensors(self):
@@ -461,7 +579,7 @@ def _scores(y, p) -> dict:
 def train_vfm(key: str, _df: pd.DataFrame, interval: int):
     """Chronological validation (last 20 % of dates unseen) + final model on all history."""
     d = _add_reference(enrich(_df), interval).dropna(subset=["Ref_Oil"])
-    feats = vfm_features(d)
+    feats = [c for c in vfm_features(d) if d[c].notna().mean() > 0.5]
     d = d.dropna(subset=feats)
     split = d["Date"].quantile(0.8)
     train, test = d[d["Date"] <= split], d[d["Date"] > split]
@@ -696,6 +814,256 @@ def rank_wells(df, dca, eq, s: Settings) -> pd.DataFrame:
 @st.cache_resource(show_spinner=False, max_entries=6)
 def rank_cached(key: str, _df, _dca, _eq, _s: Settings, settings_key: tuple):
     return rank_wells(_df, _dca, _eq, _s)
+
+
+# ---- 3f. Ask FIELDWISE — answer free-form questions about the uploaded sheet ---------
+LLM_MODEL = "claude-sonnet-5-5"   # change to "claude-opus-5-5" for harder questions, "claude-haiku-5-5" for speed
+
+DOMAIN_GUIDE = """You are FIELDWISE, a senior petroleum production engineer and data analyst.
+Answer the user's question by writing Python that computes the answer from the data. Use your own engineering
+knowledge to decide which columns are needed, even when their names are unusual: read the column names AND the
+sample values/ranges to infer meaning and units, and state any assumption you make.
+
+Available variables (already loaded — never import anything):
+- raw: pandas DataFrame — the sheet exactly as uploaded (original column names, may be messy; parse with
+  pd.to_numeric(..., errors="coerce") / pd.to_datetime(..., errors="coerce") as needed).
+- df: cleaned, standardised DataFrame. Columns & units: Date (datetime), Well (str), Oil_Rate, Water_Rate (m³/d),
+  Gas_Rate (Sm³/d), Wellhead_Pressure, Bottomhole_Pressure (bar), Injection_Rate (lift gas, Sm³/d or m³/d),
+  plus optional Choke_Size (1/64 in), Pump_Vibration (mm/s), Motor_Temperature (°C), Motor_Current (A),
+  Pump_Frequency (Hz), Energy_kWh (kWh). Prefer df for anything these columns cover; use raw for anything else.
+- ranked: one row per well with latest 7-day Oil_Rate, Water_Cut (%), Priority, Why, Status (equipment), Decline (%/yr).
+- decline: per-well Arps decline table.   - pd, np, px (plotly.express), go (plotly.graph_objects).
+
+Useful knowledge: water cut = qw/(qo+qw); GOR = qg/qo; WOR = qw/qo; liquid = qo+qw; cumulative volume =
+Σ(rate × days between samples); 1 m³ = 6.2898 bbl; 1 Sm³ = 35.3147 scf; 1 bar = 14.5038 psi;
+productivity index J = q/(Pr − Pwf); drawdown = Pr − Pwf; specific energy = kWh / bbl oil.
+
+Output rules: reply with ONE ```python code block only. The code must set:
+  answer  — a short markdown string with the actual computed numbers (use f-strings, sensible rounding, units)
+  result  — a DataFrame/Series/number to display (or None)
+  fig     — optional plotly figure (or None)
+No file, network or system access. Keep it efficient."""
+
+_SAFE_BUILTINS = {n: getattr(builtins, n) for n in (
+    "abs all any bool dict enumerate filter float format int isinstance len list map max min next print range "
+    "reversed round set slice sorted str sum tuple zip ValueError KeyError TypeError Exception True False None").split()}
+_BLOCKED_NAMES = {"open", "exec", "eval", "compile", "input", "globals", "locals", "vars", "getattr", "setattr",
+                  "delattr", "breakpoint", "help", "__import__", "memoryview", "os", "sys", "subprocess"}
+_BLOCKED_ATTR = re.compile(r"^(_|to_(csv|excel|pickle|parquet|sql|json|html|feather|hdf|clipboard|latex|markdown|xml|stata|orc)$|"
+                           r"read_|eval$|system$|popen$|write)")
+
+
+def run_safely(code: str, env: dict) -> dict:
+    """Execute model-written analysis code with no imports, no private attributes and no file/network access."""
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
+            raise PermissionError("imports are not allowed")
+        if isinstance(node, ast.Attribute) and _BLOCKED_ATTR.match(node.attr):
+            raise PermissionError(f"'{node.attr}' is not allowed")
+        if isinstance(node, ast.Name) and (node.id in _BLOCKED_NAMES or node.id.startswith("__")):
+            raise PermissionError(f"'{node.id}' is not allowed")
+    ns = {"__builtins__": _SAFE_BUILTINS, **env, "answer": None, "result": None, "fig": None}
+    exec(compile(tree, "<fieldwise-analysis>", "exec"), ns)   # noqa: S102 — sandboxed above
+    return ns
+
+
+def describe_sheet(raw: pd.DataFrame, max_cols: int = 80) -> str:
+    """Compact profile of every column (name, type, fill, range, examples) so the model can infer meaning."""
+    lines = [f"raw: {len(raw):,} rows × {raw.shape[1]} columns"]
+    for col in list(raw.columns)[:max_cols]:
+        v = raw[col]
+        nn = v.notna().mean() * 100
+        num = pd.to_numeric(v, errors="coerce")
+        if num.notna().mean() > 0.8:
+            info = f"numeric min={num.min():.4g} median={num.median():.4g} max={num.max():.4g}"
+        else:
+            info = f"text, {v.nunique()} unique, e.g. {', '.join(map(str, v.dropna().astype(str).unique()[:4]))}"
+        lines.append(f"- {str(col)!r}: {info}; {nn:.0f}% filled")
+    return "\n".join(lines)
+
+
+def _api_key() -> str | None:
+    key = st.session_state.get("anthropic_key")
+    if key:
+        return key
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:  # noqa: BLE001 — no secrets file
+        key = None
+    return key or os.environ.get("ANTHROPIC_API_KEY")
+
+
+def llm_available() -> bool:
+    try:
+        import anthropic  # noqa: F401
+    except ImportError:
+        return False
+    return bool(_api_key())
+
+
+def _extract_code(text: str) -> str:
+    m = re.search(r"```(?:python)?\s*(.*?)```", text, re.S)
+    return (m.group(1) if m else text).strip()
+
+
+def ask_llm(question: str, f: "Field", env: dict) -> dict:
+    """Claude writes the analysis, FIELDWISE runs it on the real data; one automatic self-correction on error."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=_api_key())
+    context = (f"{describe_sheet(f.raw)}\n\ndf: {len(f.df):,} rows, {f.df['Well'].nunique()} wells, "
+               f"{f.df['Date'].min():%Y-%m-%d} → {f.df['Date'].max():%Y-%m-%d}. Column mapping used: {f.report.get('mapped')}.")
+    messages = [{"role": "user", "content": f"DATA\n{context}\n\nQUESTION\n{question}"}]
+    last_err = None
+    for _ in range(2):
+        msg = client.messages.create(model=LLM_MODEL, max_tokens=2000, system=DOMAIN_GUIDE, messages=messages)
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        code = _extract_code(text)
+        try:
+            ns = run_safely(code, {k: (v.copy() if isinstance(v, pd.DataFrame) else v) for k, v in env.items()})
+            return {"engine": f"Claude · {LLM_MODEL}", "answer": ns.get("answer") or "Done.", "result": ns.get("result"),
+                    "fig": ns.get("fig"), "code": code}
+        except Exception as exc:  # noqa: BLE001 — send the error back once so the model can fix its code
+            last_err = f"{type(exc).__name__}: {exc}"
+            messages += [{"role": "assistant", "content": text},
+                         {"role": "user", "content": f"That code failed with {last_err}. Return corrected code only."}]
+    raise RuntimeError(f"The generated analysis failed twice ({last_err}).")
+
+
+# Offline engine: understands common production questions without any API, and can use ANY numeric column
+_QUANTITIES = [  # (keywords, label, how to compute from a frame, unit, is_rate)
+    (("energy per barrel", "per barrel", "kwh per bbl", "kwh/bbl", "kwh bbl", "specific energy", "energy intensity"),
+     "Energy per barrel", lambda g: g["Energy_kWh"].sum() / max(g["Oil_Rate"].sum() * M3_TO_BBL, 1e-9), "kWh/bbl", False),
+    (("water cut", "watercut", "bsw", "wc"), "Water cut", lambda g: 100 * g["Water_Rate"].sum() / max(g["Water_Rate"].sum() + g["Oil_Rate"].sum(), 1e-9), "%", False),
+    (("gas oil ratio", "gas-oil ratio", "gor"), "GOR", lambda g: g["Gas_Rate"].sum() / max(g["Oil_Rate"].sum(), 1e-9), "Sm³/m³", False),
+    (("water oil ratio", "wor"), "WOR", lambda g: g["Water_Rate"].sum() / max(g["Oil_Rate"].sum(), 1e-9), "m³/m³", False),
+    (("liquid", "gross"), "Liquid rate", "Liquid_Rate", "m³/d", True),
+    (("lift gas", "gas lift", "injection"), "Lift gas", "Injection_Rate", "", True),
+    (("oil", "production", "crude"), "Oil rate", "Oil_Rate", "m³/d", True),
+    (("water",), "Water rate", "Water_Rate", "m³/d", True),
+    (("gas",), "Gas rate", "Gas_Rate", "Sm³/d", True),
+    (("wellhead", "whp", "thp", "tubing head"), "Wellhead pressure", "Wellhead_Pressure", "bar", False),
+    (("bottomhole", "bottom hole", "bhp", "downhole"), "Bottom-hole pressure", "Bottomhole_Pressure", "bar", False),
+    (("choke", "bean"), "Choke size", "Choke_Size", "/64 in", False),
+    (("vibration",), "Pump vibration", "Pump_Vibration", "mm/s", False),
+    (("temperature", "temp"), "Motor temperature", "Motor_Temperature", "°C", False),
+    (("current", "amps"), "Motor current", "Motor_Current", "A", False),
+    (("frequency", "hz"), "Pump frequency", "Pump_Frequency", "Hz", False),
+    (("energy", "kwh", "power"), "Energy", "Energy_kWh", "kWh", True),
+]
+
+
+def ask_offline(question: str, f: "Field") -> dict:
+    canon = lambda t: " " + " ".join(re.sub(r"[^a-z0-9&]+", " ", str(t).lower()).split()) + " "  # noqa: E731
+    q = canon(question)
+    d = enrich(f.df)
+    wells = sorted(d["Well"].unique())
+    named = [w for w in wells if canon(w) in q]
+    if named:
+        d = d[d["Well"].isin(named)]
+    m = re.search(r"last (\d+)\s*(day|week|month|year)s?", q)
+    if m:
+        days = int(m.group(1)) * {"day": 1, "week": 7, "month": 30, "year": 365}[m.group(2)]
+        d = d[d["Date"] > d["Date"].max() - pd.Timedelta(days=days)]
+    for y in re.findall(r"\b(20\d\d)\b", q):
+        d = d[d["Date"].dt.year == int(y)]
+    if d.empty:
+        return {"engine": "Offline engine", "answer": "No rows match that well / period.", "result": None, "fig": None}
+
+    # Which quantity? built-in engineering quantities first, then any other column in the sheet by name similarity
+    declining = any(k in q for k in ("declin", "dropping", "falling", "decreas"))
+    qty = next((x for x in _QUANTITIES if any(canon(k) in q or canon(k + "s") in q for k in x[0])), None)
+    if qty and isinstance(qty[2], str) and (qty[2] not in d.columns or d[qty[2]].isna().all()):
+        qty = None
+    if qty and qty[1] == "Energy per barrel" and "Energy_kWh" not in d.columns:
+        return {"engine": "Offline engine", "result": None, "fig": None,
+                "answer": "Energy per barrel needs an energy (kWh) column, which this sheet does not have."}
+    if qty is None and declining:
+        qty = next(x for x in _QUANTITIES if x[2] == "Oil_Rate")
+    col_label, unit, is_rate, func, extra = None, "", False, None, None
+    if qty:
+        _, col_label, how, unit, is_rate = qty
+        func = how if callable(how) else None
+        series_col = None if callable(how) else how
+    else:
+        words = re.findall(r"[a-z][a-z0-9_]+", q)
+        best, score = None, 0.0
+        for col in f.raw.columns:
+            num = pd.to_numeric(f.raw[col], errors="coerce")
+            if num.notna().mean() < 0.6:
+                continue
+            name = _strip_units(col)
+            sc = max([difflib.SequenceMatcher(None, name, " ".join(words[i:i + n])).ratio()
+                      for n in (1, 2, 3) for i in range(max(1, len(words) - n + 1))] or [0])
+            if sc > score:
+                best, score = col, sc
+        if best is None or score < 0.72:
+            cols = ", ".join(map(str, f.raw.columns[:25]))
+            return {"engine": "Offline engine", "result": None, "fig": None,
+                    "answer": f"I couldn't tell which data that question needs. Columns in your sheet: {cols}. "
+                              "Try naming one of them, or add an Anthropic API key in Settings for full AI answers."}
+        extra = pd.DataFrame({"Date": pd.to_datetime(f.raw[f.report["mapped"]["Date"]], errors="coerce"),
+                              "Well": f.raw[f.report["mapped"]["Well"]].astype(str).str.strip().str.upper(),
+                              "Value": pd.to_numeric(f.raw[best], errors="coerce")}).dropna()
+        extra = extra[extra["Well"].isin(d["Well"].unique()) & extra["Date"].between(d["Date"].min(), d["Date"].max())]
+        d, series_col, col_label = extra, "Value", f"'{best}'"
+
+    per_well = any(k in q for k in ("per well", "each well", "by well", "which well", "which wells", "every well",
+                                    "top", "rank", "compare", "highest", "lowest", "most", "least", "worst", "best"))
+    trend = any(k in q for k in ("trend", "over time", "history", "plot", "chart", "graph", "show"))
+    agg = ("sum" if any(k in q for k in ("total", "cumulative", "sum", "produced", "how much")) else
+           "max" if any(k in q for k in ("max", "highest", "peak", "most", "top", "best")) else
+           "min" if any(k in q for k in ("min", "lowest", "least", "worst", "smallest")) else "mean")
+
+    def value(g):
+        if func:
+            return func(g)
+        s = g[series_col]
+        if agg == "sum" and is_rate:   # cumulative volume = Σ rate × Δt
+            dt = g["Date"].sort_values().diff().dt.total_seconds().div(86400).median()
+            return float(s.sum() * (dt if pd.notna(dt) and dt > 0 else 1.0))
+        return float(getattr(s, agg)())
+
+    vol_unit = unit.replace("/d", "") if (agg == "sum" and is_rate and unit.endswith("/d")) else unit
+    u = f" {vol_unit}" if vol_unit else ""
+    if agg == "sum" and is_rate and col_label.endswith(" rate"):
+        col_label = col_label[:-5] + " produced"
+    if declining:
+        rows = []
+        for w, g in d.groupby("Well"):
+            g = g.sort_values("Date")
+            a, b = g.tail(30)[series_col or "Oil_Rate"].mean(), g.iloc[-60:-30][series_col or "Oil_Rate"].mean()
+            rows.append({"Well": w, "Last 30 obs": a, "Previous 30 obs": b, "Change (%)": (a / b - 1) * 100 if b else np.nan})
+        res = pd.DataFrame(rows).sort_values("Change (%)")
+        dec = res[res["Change (%)"] < -2]
+        ans = (f"**{len(dec)} of {len(res)} wells** are declining (>2% drop, last 30 vs previous 30 observations). "
+               f"Steepest: " + ", ".join(f"{r.Well} ({r['Change (%)']:.1f}%)" for _, r in dec.head(3).iterrows())) if len(dec) else \
+              "No well shows a decline of more than 2% between the last two 30-observation windows."
+        return {"engine": "Offline engine", "answer": ans, "result": res, "fig": None}
+    if trend:
+        if func:
+            t = d.groupby("Date").apply(func, include_groups=False).rename(col_label).reset_index()
+            fig = px.line(t, x="Date", y=col_label)
+        else:
+            t = d.groupby(["Date", "Well"])[series_col].mean().reset_index() if (per_well or named) else \
+                d.groupby("Date")[series_col].agg("sum" if is_rate else "mean").reset_index()
+            fig = px.line(t, x="Date", y=series_col, color="Well" if "Well" in t.columns else None)
+        return {"engine": "Offline engine", "answer": f"{col_label} over time" + (f" for {', '.join(named)}" if named else "") + ".",
+                "result": None, "fig": fig}
+    if per_well or (not named and agg in ("max", "min")):
+        res = d.groupby("Well").apply(value, include_groups=False).rename(col_label).reset_index()
+        res = res.sort_values(col_label, ascending=(agg == "min"))
+        top = res.iloc[0]
+        word = {"sum": "total", "max": "highest", "min": "lowest", "mean": "average"}[agg]
+        ans = (f"**{top['Well']}** has the {word if agg in ('max', 'min') else 'highest ' + word} {col_label}: "
+               f"**{top[col_label]:,.2f}{u}**.")
+        return {"engine": "Offline engine", "answer": ans, "result": res, "fig": None}
+    val = value(d) if (func or agg == "sum" or not is_rate) else \
+        float(d.groupby("Date")[series_col].sum().mean())     # field-level average daily rate
+    scope = ", ".join(named) if named else "the field"
+    word = {"sum": "Total", "max": "Maximum", "min": "Minimum", "mean": "Average"}[agg]
+    return {"engine": "Offline engine", "answer": f"{word} {col_label} for {scope}: **{val:,.2f}{u}** "
+            f"({d['Date'].min():%d %b %Y} → {d['Date'].max():%d %b %Y}).", "result": None, "fig": None}
 
 
 # =============================================================================
@@ -1284,7 +1652,8 @@ def page_quality(f: Field):
     a, b = st.columns(2, gap="large")
     with a:
         card_header("Column mapping", "your header → FIELDWISE field")
-        table(pd.DataFrame([{"FIELDWISE field": k, "Your column": v} for k, v in r["mapped"].items()]), height=430)
+        table(pd.DataFrame([{"FIELDWISE field": k, "Your column": v, "How recognised": r.get("how", {}).get(k, "")}
+                            for k, v in r["mapped"].items()]), height=430)
     with b:
         card_header("Cleaning log")
         items = [f"Rows without a valid date or well ID removed: <b>{r['bad_keys']}</b>",
@@ -1294,6 +1663,10 @@ def page_quality(f: Field):
         if r["conversions"]:
             items.append("Units converted: " + ", ".join(f"<b>{esc(c['Field'])}</b> {esc(c['From'])} → {esc(c['To'])}"
                                                          for c in r["conversions"]))
+        if r.get("derived"):
+            items.append("Derived using petroleum relationships: " + "; ".join(f"<b>{esc(x)}</b>" for x in r["derived"]))
+        if r.get("absent"):
+            items.append("Not in file (modules adapt automatically): <b>" + esc(", ".join(r["absent"])) + "</b>")
         if r["dropped_optional"]:
             items.append("Dropped (more than 60 % empty): <b>" + esc(", ".join(r["dropped_optional"])) + "</b>")
         items.append("Choke size: " + ("<b>present</b> — gaps carried forward per well, never interpolated"
@@ -1306,6 +1679,69 @@ def page_quality(f: Field):
     card_header("Clean data preview", "first 200 rows")
     table(f.df.head(200), 2, height=360)
     st.download_button("⬇ Download clean data (CSV)", f.df.to_csv(index=False).encode(), "fieldwise_clean.csv", "text/csv")
+
+
+EXAMPLE_QUESTIONS = ["Which well has the highest gas-oil ratio?", "Total oil produced by each well in the last 30 days",
+                     "Which wells are declining?", "Average water cut per well",
+                     "Show the oil rate trend of the top-priority well", "What is the energy used per barrel for each well?"]
+
+
+def _render_result(item: dict):
+    st.markdown(f'<div class="fw-card-h"><div class="fw-card-title">❓ {esc(item["q"])}</div>'
+                f'<div class="fw-card-sub">{esc(item["engine"])}</div></div>', unsafe_allow_html=True)
+    st.markdown(item["answer"])
+    res = item.get("result")
+    if isinstance(res, pd.Series):
+        res = res.reset_index() if res.index.name or isinstance(res.index, pd.MultiIndex) else res.to_frame()
+    if isinstance(res, pd.DataFrame) and not res.empty:
+        table(res.head(500), 2, height=min(420, 38 + 35 * min(len(res), 11)))
+    elif isinstance(res, (int, float, np.integer, np.floating)) and np.isfinite(res):
+        kpi("Result", f"{res:,.4g}")
+    if item.get("fig") is not None:
+        try:
+            chart(item["fig"], 360)
+        except Exception:  # noqa: BLE001
+            st.caption("The chart could not be drawn.")
+    if item.get("code"):
+        with st.expander("How it was calculated"):
+            st.code(item["code"], language="python")
+
+
+@_fragment
+def page_ask(f: Field, ranked, dca):
+    smart = llm_available()
+    page_header("Ask FIELDWISE", "Ask anything about your sheet in plain English — including columns the dashboard "
+                "does not use. FIELDWISE works out which data it needs, calculates on the real numbers and shows how.",
+                f"Claude · {LLM_MODEL}" if smart else "Offline engine")
+    if not smart:
+        note("Running the <b>offline engine</b>: it handles totals, averages, highs/lows, trends, declines and ratios "
+             "(water cut, GOR, WOR) per well or field, and can use <i>any</i> numeric column by name. "
+             "For open-ended questions, add an Anthropic API key under <b>AI assistant</b> in the sidebar.")
+    st.caption("Try one:")
+    cols = st.columns(3)
+    for i, ex in enumerate(EXAMPLE_QUESTIONS):
+        with cols[i % 3]:
+            if st.button(ex, key=f"ex_{i}", **W):
+                st.session_state["ask_q"] = ex.replace("the top-priority well", str(ranked.iloc[0]["Well"]))
+    q = st.text_input("Your question", key="ask_q", placeholder="e.g. Which well had the biggest drop in oil last month?")
+    if st.button("Ask", type="primary") and q.strip():
+        env = {"raw": f.raw, "df": f.df, "ranked": ranked, "decline": dca, "pd": pd, "np": np, "px": px, "go": go}
+        with st.spinner("Thinking about your data…"):
+            out = None
+            if smart:
+                try:
+                    out = ask_llm(q, f, env)
+                except Exception as exc:  # noqa: BLE001 — fall back to the offline engine
+                    st.warning(f"AI assistant unavailable ({type(exc).__name__}); answered with the offline engine.")
+            if out is None:
+                try:
+                    out = ask_offline(q, f)
+                except Exception as exc:  # noqa: BLE001
+                    out = {"engine": "Offline engine", "answer": f"Sorry — I could not compute that ({exc}).",
+                           "result": None, "fig": None}
+        st.session_state.setdefault("ask_history", []).insert(0, {"q": q, **out})
+    for item in st.session_state.get("ask_history", [])[:6]:
+        _render_result(item)
 
 
 def page_method():
@@ -1332,7 +1768,7 @@ def page_method():
 # =============================================================================
 # 7. MAIN
 # =============================================================================
-PAGES = {"Command Centre": "📊", "AI Production Model": "🧠", "Decline & Forecast": "📉", "Lift-Gas Optimiser": "⚖️",
+PAGES = {"Command Centre": "📊", "Ask FIELDWISE": "💬", "AI Production Model": "🧠", "Decline & Forecast": "📉", "Lift-Gas Optimiser": "⚖️",
          "Equipment Health": "🛠️", "Well Explorer": "🔎", "Data & Quality": "🧹", "Methodology": "📘"}
 
 
@@ -1340,6 +1776,14 @@ def _file_token(up, data: bytes) -> str:
     """Cheap, stable identity for an upload (avoids hashing the whole file on every rerun)."""
     head = hashlib.md5(data[:1 << 20] + data[-(1 << 20):]).hexdigest()
     return f"{up.name}|{len(data)}|{head}"
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def infer_cached(key: str, _raw: pd.DataFrame):
+    return infer_columns(_raw)
+
+
+NOT_IN_FILE = "— not in file —"
 
 
 def sidebar_upload():
@@ -1356,29 +1800,66 @@ def sidebar_upload():
     sheet = list(sheets)[0]
     if len(sheets) > 1:
         sheet = st.sidebar.selectbox("Sheet", list(sheets))
-    sample, mapped, _ = map_columns(sheets[sheet].head(200))
-    units, detected = {}, {}
-    for col in UNITS:
-        if col in sample.columns:
-            detected[col] = detect_unit(mapped.get(col, ""), col) or STD_UNIT[col]
-    auto = [f"{c.replace('_', ' ')}: {u}" for c, u in detected.items() if u != STD_UNIT[c]]
-    with st.sidebar.expander("Source units" + (f" · {len(auto)} auto-detected" if auto else ""), expanded=False):
+    raw = sheets[sheet]
+    auto, how = infer_cached(f"{token}|{sheet}", raw)
+
+    # --- Column mapping: automatic guess, every field correctable by the user
+    options = [NOT_IN_FILE] + [str(c) for c in raw.columns]
+    need_help = any(f not in auto for f in ["Date", "Well"]) or not ({"Oil_Rate", "Liquid_Rate"} & set(auto))
+    mapping, manual = {}, []
+    with st.sidebar.expander(f"Column mapping · {len(auto)} recognised", expanded=need_help):
+        st.caption("FIELDWISE matched your headers by name and by their values. Fix any wrong guess; "
+                   "* = required (oil can also be derived from liquid rate + water cut).")
+        for field in ALL_FIELDS:
+            guess = auto.get(field)
+            idx = options.index(guess) if guess in options else 0
+            label = field.replace("_", " ") + (" *" if field in REQUIRED else "")
+            sel = st.selectbox(label, options, index=idx, key=f"m_{token}_{sheet}_{field}",
+                               help=f"Auto: {how[field]}" if field in how else "Not found automatically")
+            mapping[field] = None if sel == NOT_IN_FILE else sel
+            if mapping[field] != guess:
+                manual.append(field)
+
+    units, auto_units = {}, []
+    present = [f for f in UNITS if mapping.get(f)]
+    with st.sidebar.expander("Source units", expanded=False):
         st.caption("Detected from your column headers where possible — change any that are wrong.")
-        for col, guess in detected.items():
+        for col in present:
             keys = list(UNITS[col])
-            units[col] = st.selectbox(col.replace("_", " "), keys, index=keys.index(guess), key=f"u_{token}_{col}")
+            guess = detect_unit(mapping[col], col) or STD_UNIT[col]
+            if guess != STD_UNIT[col]:
+                auto_units.append(f"{col.replace('_', ' ')}: {guess}")
+            units[col] = st.selectbox(col.replace("_", " "), keys, index=keys.index(guess), key=f"u_{token}_{sheet}_{col}")
+    map_key = tuple(sorted(mapping.items()))
     try:
-        df, rep = clean_cached(f"{token}|{sheet}", sheets, sheet, tuple(sorted(units.items())))
+        df, rep = clean_cached(f"{token}|{sheet}", sheets, sheet, tuple(sorted(units.items())), map_key)
     except Exception as exc:  # noqa: BLE001
         return None, f"Could not process {up.name}: {exc}"
     if df is None:
         if rep.get("missing"):
-            return None, ("Required columns not found: " + ", ".join(rep["missing"]) + ". Recognised: " +
-                          (", ".join(rep["mapped"]) or "none") + ". Rename the headers or start from the template.")
+            need = ", ".join(m.replace("_", " ") for m in rep["missing"])
+            return None, (f"Could not find: {need}. Open **Column mapping** in the sidebar and pick the matching "
+                          f"columns from your file (oil can also be derived from liquid rate + water cut).")
         return None, rep.get("error", "The data could not be cleaned.")
-    rep = {**rep, "auto_units": auto}
-    key = f"{token}|{sheet}|{sorted(units.items())}"
-    return Field(df=df, name=up.name, report=rep, lift_is_gas=units.get("Injection_Rate", "Sm³/d") in _GAS, key=key), None
+    rep = {**rep, "auto_units": auto_units,
+           "how": {f: ("set manually" if f in manual else how.get(f, "")) for f in rep["mapped"]}}
+    key = f"{token}|{sheet}|{sorted(units.items())}|{map_key}"
+    return Field(df=df, name=up.name, report=rep, lift_is_gas=units.get("Injection_Rate", "Sm³/d") in _GAS,
+                 key=key, raw=raw), None
+
+
+def sidebar_ai():
+    with st.sidebar.expander("AI assistant", expanded=False):
+        try:
+            import anthropic  # noqa: F401
+        except ImportError:
+            st.caption("Add `anthropic` to requirements.txt to enable Claude-powered answers.")
+            return
+        if _api_key() and not st.session_state.get("anthropic_key"):
+            st.caption("✅ API key loaded from secrets.")
+            return
+        st.text_input("Anthropic API key", type="password", key="anthropic_key",
+                      help="Kept only in this browser session. On Streamlit Cloud you can set ANTHROPIC_API_KEY in Secrets instead.")
 
 
 def sidebar_settings() -> Settings:
@@ -1408,6 +1889,7 @@ def main():
         return
 
     settings = sidebar_settings()
+    sidebar_ai()
     field.report = {**field.report, "interval": settings.test_interval, "co2": settings.co2, "oil_price": settings.oil_price}
     page = st.sidebar.radio("Navigate", list(PAGES), format_func=lambda p: f"{PAGES[p]}  {p}")
     st.sidebar.markdown(footer, unsafe_allow_html=True)
@@ -1425,6 +1907,8 @@ def main():
 
     if page == "Command Centre":
         page_overview(field, ranked, vfm, dca, fc, curves)
+    elif page == "Ask FIELDWISE":
+        page_ask(field, ranked, dca)
     elif page == "AI Production Model":
         page_model(field, vfm)
     elif page == "Decline & Forecast":
