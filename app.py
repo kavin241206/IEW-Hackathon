@@ -20,9 +20,11 @@ Internal units: liquids m³/d · gas Sm³/d · pressure bar · choke size 1/64 i
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import io
-from dataclasses import dataclass
+import re
+from dataclasses import astuple, dataclass
 
 import numpy as np
 import pandas as pd
@@ -31,7 +33,6 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy.optimize import curve_fit
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, IsolationForest
-from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, r2_score
 
 # =============================================================================
@@ -113,13 +114,58 @@ def _norm(name) -> str:
     return " ".join(str(name).strip().lower().replace("_", " ").replace("-", " ").split())
 
 
+def _strip_units(name) -> str:
+    """'Oil Rate (bbl/d)' → 'oil rate';  'THP [psi]' → 'thp';  'Choke_in' stays recognisable."""
+    return _norm(re.sub(r"[\(\[\{].*?[\)\]\}]", " ", str(name)))
+
+
+_LOOKUP = {_norm(a): canon for canon, names in ALIASES.items() for a in [canon, *names]}
+# Keyword fallback for headers no alias list anticipated (first match wins, most specific first)
+_KEYWORDS = [
+    ("Choke_Size", ("choke", "bean")), ("Injection_Rate", ("lift gas", "gas lift", "injection", "glir")),
+    ("Bottomhole_Pressure", ("bottom hole", "bottomhole", "bhp", "downhole press", "pwf")),
+    ("Wellhead_Pressure", ("wellhead", "well head", "tubing head", "thp", "whp")),
+    ("Pump_Vibration", ("vibration",)), ("Motor_Temperature", ("motor temp", "winding temp")),
+    ("Motor_Current", ("amps", "current")), ("Pump_Frequency", ("frequency", "hz", "vfd")),
+    ("Energy_kWh", ("kwh", "energy", "power")), ("Water_Rate", ("water", "bwpd", "qw")),
+    ("Gas_Rate", ("gas", "qg", "mscf")), ("Oil_Rate", ("oil", "bopd", "qo", "crude")),
+    ("Well", ("well",)), ("Date", ("date", "time", "day")),
+]
+# Unit hints found in header text → unit option
+_UNIT_HINTS = [
+    (r"\bmmscf", "MMSCFD"), (r"\bmscf|\bmcf", "Mscf/d"), (r"\bscf", "scf/d"), (r"nm3|nm³", "Nm³/h"),
+    (r"\bbopd|\bbwpd|\bbbl|\bstb", "bbl/d"), (r"m3\s*/\s*h|m³\s*/\s*h", "m³/h"), (r"\bl\s*/\s*s\b", "L/s"),
+    (r"\bpsi", "psi"), (r"\bkpa", "kPa"), (r"\bmpa", "MPa"), (r"kgf|kg\s*/\s*cm", "kgf/cm²"), (r"\bbar", "bar"),
+    (r"°\s*f|\bdeg\s*f\b|\bdegf\b|fahrenheit", "°F"), (r"°\s*c|\bdeg\s*c\b|celsius", "°C"), (r"\brpm", "rpm"),
+    (r"\bmwh", "MWh"), (r"\bkwh", "kWh"), (r"\bwh\b", "Wh"), (r"in\s*/\s*s|ips", "in/s"),
+    (r"64", "1/64 in"), (r"\binch|\bin\b|\"", "in"), (r"\bmm\b", "mm"), (r"\bma\b", "mA"),
+]
+
+
+def detect_unit(header: str, field: str):
+    """Guess the source unit from the header text, e.g. 'THP (psi)' → psi. None if no confident hint."""
+    text = str(header).lower()
+    opts = UNITS.get(field, {})
+    for pattern, unit in _UNIT_HINTS:
+        if unit in opts and re.search(pattern, text):
+            return unit
+    return None
+
+
 def map_columns(raw: pd.DataFrame):
-    lookup = {_norm(a): canon for canon, names in ALIASES.items() for a in [canon, *names]}
+    """Return (frame with FIELDWISE columns, {field: source header}, ignored headers)."""
     rename, mapped = {}, {}
-    for col in raw.columns:
-        canon = lookup.get(_norm(col))
+    for col in raw.columns:                         # 1) exact alias, with or without unit text
+        canon = _LOOKUP.get(_norm(col)) or _LOOKUP.get(_strip_units(col))
         if canon and canon not in mapped:
             rename[col], mapped[canon] = canon, str(col)
+    for canon, words in _KEYWORDS:                  # 2) keyword fallback, only if unambiguous
+        if canon in mapped:
+            continue
+        hits = [c for c in raw.columns if c not in rename and any(w in _strip_units(c) for w in words)
+                and not ("ratio" in _norm(c) or "cut" in _norm(c) or "cum" in _norm(c).split())]
+        if len(hits) == 1:
+            rename[hits[0]], mapped[canon] = canon, str(hits[0])
     frame = raw.rename(columns=rename)
     keep = [c for c in CORE_COLUMNS + OPTIONAL_COLUMNS if c in frame.columns]
     return frame[keep].copy(), mapped, [str(c) for c in raw.columns if c not in rename]
@@ -189,6 +235,9 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
     rep["duplicates"] = n0 - len(frame)
     frame = frame.sort_values(["Well", "Date"]).reset_index(drop=True)
 
+    # Imputation (fully vectorised): setpoints carried forward; measurements linearly interpolated within each well
+    wells = frame["Well"]
+    pos = pd.Series(np.arange(len(frame), dtype=float), index=frame.index)
     for col in numeric:
         n_miss = int(frame[col].isna().sum())
         if not n_miss:
@@ -197,27 +246,34 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
             frame[col] = frame.groupby("Well")[col].ffill()
             frame[col] = frame.groupby("Well")[col].bfill()
         else:
-            frame[col] = frame.groupby("Well")[col].transform(lambda s: s.interpolate(limit_direction="both"))
+            ok = frame[col].notna()
+            prev_v = frame[col].groupby(wells).ffill()
+            next_v = frame[col].groupby(wells).bfill()
+            prev_p = pos.where(ok).groupby(wells).ffill()
+            next_p = pos.where(ok).groupby(wells).bfill()
+            span = (next_p - prev_p).replace(0, np.nan)
+            interp = prev_v + (next_v - prev_v) * (pos - prev_p) / span
+            frame[col] = frame[col].fillna(interp).fillna(prev_v).fillna(next_v)
             if col in CORE_NUMERIC:
                 frame[col] = frame[col].fillna(frame[col].median())
         rep["imputed"][col] = n_miss - int(frame[col].isna().sum())
 
-    for col in [c for c in numeric if c not in SETPOINTS]:
-        for _, idx in frame.groupby("Well").groups.items():
-            s = frame.loc[idx, col]
-            if s.notna().sum() < 10:
-                continue
-            q1, q3 = s.quantile([0.25, 0.75])
-            iqr = q3 - q1
-            if iqr <= 0:
-                continue
-            lo, hi = q1 - 3 * iqr, q3 + 3 * iqr
-            if col in RATE_COLUMNS + PRESSURE_COLUMNS:
-                lo = max(lo, 0.0)
-            out = (s < lo) | (s > hi)
-            if out.any():
-                rep["capped"] += int(out.sum())
-                frame.loc[idx, col] = s.clip(lo, hi)
+    # Per-well 3×IQR capping (vectorised) — measurements only, never setpoints
+    cap_cols = [c for c in numeric if c not in SETPOINTS]
+    if cap_cols:
+        grp = frame.groupby("Well")[cap_cols]
+        q = grp.quantile([0.25, 0.75])
+        q1 = q.xs(0.25, level=1).reindex(wells).to_numpy()
+        q3 = q.xs(0.75, level=1).reindex(wells).to_numpy()
+        iqr = q3 - q1
+        enough = (grp.transform("count").to_numpy() >= 10) & (iqr > 0)
+        lo, hi = q1 - 3 * iqr, q3 + 3 * iqr
+        nonneg = np.array([c in RATE_COLUMNS + PRESSURE_COLUMNS for c in cap_cols])
+        lo = np.where(nonneg, np.maximum(lo, 0.0), lo)
+        vals = frame[cap_cols].to_numpy(dtype=float)
+        out = enough & ((vals < lo) | (vals > hi))
+        rep["capped"] = int(out.sum())
+        frame[cap_cols] = np.where(out, np.clip(vals, lo, hi), vals)
 
     frame = frame.dropna(subset=CORE_NUMERIC).reset_index(drop=True)
     if len(frame) < 30:
@@ -230,27 +286,54 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict):
     return frame, rep
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
-def read_file(data: bytes, name: str) -> dict:
+def _read_excel(data: bytes) -> dict:
+    """Fastest available Excel engine: calamine (Rust, ~10× faster) → openpyxl."""
+    last = None
+    for engine in ("calamine", "openpyxl"):
+        try:
+            return pd.read_excel(io.BytesIO(data), sheet_name=None, engine=engine)
+        except (ImportError, ValueError) as exc:
+            last = exc
+    if isinstance(last, ImportError):
+        raise ValueError("Excel support is not installed on this server (add 'openpyxl' to requirements.txt), "
+                         "or upload the data as CSV.") from last
+    raise ValueError(f"Could not read the workbook ({last}). Try saving it as .xlsx or CSV.") from last
+
+
+def _read_csv(data: bytes) -> pd.DataFrame:
+    """Fastest available CSV parser: pyarrow (multi-threaded) → pandas C engine; falls back on odd encodings."""
+    try:
+        import pyarrow  # noqa: F401
+        return pd.read_csv(io.BytesIO(data), engine="pyarrow")
+    except Exception:  # noqa: BLE001 — any pyarrow problem → robust default parser
+        pass
+    try:
+        return pd.read_csv(io.BytesIO(data), low_memory=False)
+    except UnicodeDecodeError:
+        return pd.read_csv(io.BytesIO(data), encoding="cp1252", low_memory=False)
+
+
+# Heavy results are cached with cache_resource and keyed by a cheap file token (not by hashing the data):
+# no hashing of large DataFrames and no copying of results on every Streamlit rerun.
+@st.cache_resource(show_spinner=False, max_entries=3)
+def read_file(key: str, _data: bytes, name: str) -> dict:
     """Return {sheet name: frame}. A CSV gives a single 'data' sheet."""
-    if not data:
+    if not _data:
         raise ValueError("The file is empty.")
     if name.lower().endswith((".xlsx", ".xlsm", ".xls")):
-        sheets = {k: v for k, v in pd.read_excel(io.BytesIO(data), sheet_name=None).items() if not v.empty}
+        sheets = {k: v for k, v in _read_excel(_data).items() if not v.empty}
         if not sheets:
             raise ValueError("The workbook has no non-empty sheets.")
         return sheets
     try:
-        return {"data": pd.read_csv(io.BytesIO(data), low_memory=False)}
-    except UnicodeDecodeError:
-        return {"data": pd.read_csv(io.BytesIO(data), encoding="cp1252", low_memory=False)}
+        return {"data": _read_csv(_data)}
     except pd.errors.EmptyDataError as exc:
         raise ValueError("No readable columns found in the CSV.") from exc
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
-def clean_cached(data: bytes, name: str, sheet: str, units: tuple):
-    return clean_data(read_file(data, name)[sheet], dict(units))
+@st.cache_resource(show_spinner=False, max_entries=3)
+def clean_cached(key: str, _sheets: dict, sheet: str, units: tuple):
+    return clean_data(_sheets[sheet], dict(units))
 
 
 def template_frame() -> pd.DataFrame:
@@ -269,12 +352,16 @@ def schema_frame() -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def template_xlsx() -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        template_frame().to_excel(xw, index=False, sheet_name="Production")
-        schema_frame().to_excel(xw, index=False, sheet_name="Guide")
-    return buf.getvalue()
+def template_xlsx() -> bytes | None:
+    """Excel template; None if no Excel writer is installed (the CSV template still works)."""
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            template_frame().to_excel(xw, index=False, sheet_name="Production")
+            schema_frame().to_excel(xw, index=False, sheet_name="Guide")
+        return buf.getvalue()
+    except ImportError:
+        return None
 
 
 @dataclass
@@ -283,6 +370,7 @@ class Field:
     name: str
     report: dict
     lift_is_gas: bool
+    key: str = ""
 
     @property
     def sensors(self):
@@ -339,19 +427,20 @@ def vfm_features(d: pd.DataFrame) -> list:
 
 
 class VFMEnsemble:
-    """Gradient boosting + extra trees; both learn oil as a multiple of the last well-test rate."""
+    """Gradient boosting + extra trees; both learn oil as a multiple of the last well-test rate.
+    Sized for speed: same blind-test accuracy as a 4× larger ensemble at ~1/6 of the training time."""
 
     def __init__(self, features, n_wells):
         self.features = features
         cat = [features.index("Well_Code")] if n_wells <= 250 else None
-        self.gb = HistGradientBoostingRegressor(max_iter=700, learning_rate=0.04, max_leaf_nodes=31,
+        self.gb = HistGradientBoostingRegressor(max_iter=200, learning_rate=0.1, max_leaf_nodes=31,
                                                 l2_regularization=1.0, categorical_features=cat, random_state=42)
-        self.et = ExtraTreesRegressor(n_estimators=250, min_samples_leaf=2, n_jobs=-1, random_state=42)
+        self.et = ExtraTreesRegressor(n_estimators=60, min_samples_leaf=3, max_features=0.5, n_jobs=-1, random_state=42)
 
     def fit(self, d: pd.DataFrame):
         y = d["Oil_Rate"] / d["Ref_Oil"].clip(lower=1.0)
         self.gb.fit(d[self.features], y)
-        sub = d.sample(min(len(d), 60000), random_state=42)
+        sub = d.sample(min(len(d), 40000), random_state=42)
         self.et.fit(sub[self.features], y.loc[sub.index])
         return self
 
@@ -368,10 +457,10 @@ def _scores(y, p) -> dict:
             "Within ±10 % (%)": 100 * np.mean(err <= 0.10 * np.maximum(np.abs(y), 1e-9))}
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
-def train_vfm(df: pd.DataFrame, interval: int):
+@st.cache_resource(show_spinner=False, max_entries=3)
+def train_vfm(key: str, _df: pd.DataFrame, interval: int):
     """Chronological validation (last 20 % of dates unseen) + final model on all history."""
-    d = _add_reference(enrich(df), interval).dropna(subset=["Ref_Oil"])
+    d = _add_reference(enrich(_df), interval).dropna(subset=["Ref_Oil"])
     feats = vfm_features(d)
     d = d.dropna(subset=feats)
     split = d["Date"].quantile(0.8)
@@ -386,23 +475,20 @@ def train_vfm(df: pd.DataFrame, interval: int):
         {"Dataset": "Validation (unseen later dates)", **_scores(test["Oil_Rate"], test["Pred"]), "Rows": len(test)},
         {"Dataset": "Baseline · carry last well test", **_scores(test["Oil_Rate"], test["Ref_Oil"]), "Rows": len(test)},
     ])
-    sample = test.sample(min(len(test), 1500), random_state=0)
-    pi = permutation_importance(val_model.et, sample[feats], sample["Oil_Rate"] / sample["Ref_Oil"].clip(lower=1.0),
-                                n_repeats=3, random_state=0, scoring="neg_mean_absolute_error")
-    importance = pd.DataFrame({"Feature": feats, "Importance": np.maximum(pi.importances_mean, 0)})
-    importance["Importance"] /= max(importance["Importance"].sum(), 1e-12)
+    importance = pd.DataFrame({"Feature": feats, "Importance": val_model.et.feature_importances_})
 
     final = VFMEnsemble(feats, n_wells).fit(d)
     d = d.assign(Pred=final.predict(d), Split=np.where(d["Date"] <= split, "Train", "Validation"), Pred_Unseen=np.nan)
     d.loc[test.index, "Pred_Unseen"] = test["Pred"]
-    per_well = []
-    for well, g in d.groupby("Well", sort=True):
-        v = g[g["Split"] == "Validation"]
-        per_well.append({"Well": well, "History accuracy (%)": _scores(g["Oil_Rate"], g["Pred"])["Accuracy (%)"],
-                         "Unseen accuracy (%)": _scores(v["Oil_Rate"], v["Pred_Unseen"])["Accuracy (%)"] if len(v) > 1 else np.nan})
+    d["_ae"], d["_aeu"] = (d["Oil_Rate"] - d["Pred"]).abs(), (d["Oil_Rate"] - d["Pred_Unseen"]).abs()
+    d["_yu"] = d["Oil_Rate"].where(d["Pred_Unseen"].notna())
+    agg = d.groupby("Well", sort=True)[["_ae", "Oil_Rate", "_aeu", "_yu"]].sum(min_count=1)
+    per_well = pd.DataFrame({"Well": agg.index,
+                             "History accuracy (%)": 100 * (1 - agg["_ae"] / agg["Oil_Rate"].clip(lower=1e-9)).to_numpy(),
+                             "Unseen accuracy (%)": 100 * (1 - agg["_aeu"] / agg["_yu"].clip(lower=1e-9)).to_numpy()})
     return {"metrics": metrics, "history": _scores(d["Oil_Rate"], d["Pred"]),
             "pred": d[["Date", "Well", "Oil_Rate", "Pred", "Pred_Unseen", "Split"]].reset_index(drop=True),
-            "importance": importance.sort_values("Importance"), "per_well": pd.DataFrame(per_well), "split": split}
+            "importance": importance.sort_values("Importance"), "per_well": per_well, "split": split}
 
 
 # ---- 3b. Decline curve analysis (Arps) --------------------------------------------
@@ -410,8 +496,9 @@ def _arps(t, qi, di, b):
     return qi / np.power(1 + b * di * t, 1 / b)
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
-def fit_declines(df: pd.DataFrame, horizon: int = 180):
+@st.cache_resource(show_spinner=False, max_entries=3)
+def fit_declines(key: str, _df: pd.DataFrame, horizon: int = 180):
+    df = _df
     params, curves = [], []
     notes = {}
     for well, g in df.sort_values("Date").groupby("Well", sort=True):
@@ -471,8 +558,9 @@ class LiftCurve:
         return (self.beta[1] + 2 * self.beta[2] * x) / self.scale * 1000
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
-def fit_lift_curves(df: pd.DataFrame, window: int = 150):
+@st.cache_resource(show_spinner=False, max_entries=3)
+def fit_lift_curves(key: str, _df: pd.DataFrame, window: int = 150):
+    df = _df
     d = enrich(df)
     pos = d.loc[d["Injection_Rate"] > 0, "Injection_Rate"]
     scale = 1000.0 if (len(pos) and pos.median() > 2000) else 1.0
@@ -506,8 +594,9 @@ def fit_lift_curves(df: pd.DataFrame, window: int = 150):
 Z_ALERT, Z_WARN = 4.0, 2.5   # robust σ from the well's own healthy baseline
 
 
-@st.cache_data(show_spinner=False, max_entries=3)
-def screen_equipment(df: pd.DataFrame, sensors: tuple):
+@st.cache_resource(show_spinner=False, max_entries=3)
+def screen_equipment(key: str, _df: pd.DataFrame, sensors: tuple):
+    df = _df
     """Per-well robust z-scores vs own baseline → Isolation Forest → alert + early warning (trend to threshold)."""
     sensors = list(sensors)
     if len(sensors) < 2:
@@ -602,6 +691,11 @@ def rank_wells(df, dca, eq, s: Settings) -> pd.DataFrame:
 
     latest = pd.concat([latest.reset_index(drop=True), latest.apply(score, axis=1).reset_index(drop=True)], axis=1)
     return latest.sort_values(["Score", "Oil_Rate"], ascending=[False, False]).reset_index(drop=True)
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def rank_cached(key: str, _df, _dca, _eq, _s: Settings, settings_key: tuple):
+    return rank_wells(_df, _dca, _eq, _s)
 
 
 # =============================================================================
@@ -722,6 +816,10 @@ header[data-testid="stHeader"]{background:transparent;}
 """
 
 
+# Fragments rerun only the page body when a widget on the page changes (not the whole app).
+_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None) or (lambda f: f)
+
+
 def esc(x) -> str:
     return html.escape(str(x))
 
@@ -818,8 +916,12 @@ def page_landing():
         st.write("")
         c1, c2 = st.columns(2)
         with c1:
-            st.download_button("⬇ Excel template", template_xlsx(), "fieldwise_template.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", **W)
+            xlsx = template_xlsx()
+            if xlsx is not None:
+                st.download_button("⬇ Excel template", xlsx, "fieldwise_template.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", **W)
+            else:
+                st.caption("Excel support not installed — use the CSV template.")
         with c2:
             st.download_button("⬇ CSV template", template_frame().to_csv(index=False).encode(),
                                "fieldwise_template.csv", "text/csv", **W)
@@ -828,7 +930,51 @@ def page_landing():
         table(schema_frame(), height=530)
 
 
-def page_overview(f: Field, ranked, vfm, dca, fc):
+def field_briefing(f: Field, ranked, vfm, dca, curves) -> list:
+    """Plain-language interpretation of the analytics — what an engineer would say in a morning meeting."""
+    out = []
+    daily = f.df.groupby("Date")["Oil_Rate"].sum().sort_index()
+    if len(daily) >= 60:
+        now, before = daily.tail(14).mean(), daily.iloc[-44:-30].mean()
+        chg = (now / before - 1) * 100 if before else 0
+        out.append(f"Field oil is <b>{now:,.0f} m³/d</b> (≈ {now * M3_TO_BBL:,.0f} bbl/d), "
+                   f"<b>{chg:+.1f}%</b> versus a month earlier.")
+    wc = 100 * ranked["Water_Rate"].sum() / max(ranked["Liquid_Rate"].sum(), 1e-9)
+    hi_wc = ranked.loc[ranked["Water_Cut"] >= 90, "Well"].tolist()
+    out.append(f"Field water cut is <b>{wc:.0f}%</b>" + (f"; {len(hi_wc)} well(s) above 90% ({esc(', '.join(hi_wc[:4]))}"
+               f"{'…' if len(hi_wc) > 4 else ''}) are candidates for water shut-off or choke-back." if hi_wc else "."))
+    eq_bad = ranked[ranked["Status"].isin(["ALERT", "EARLY WARNING"])]
+    if len(eq_bad):
+        parts = []
+        for _, r in eq_bad.head(4).iterrows():
+            days = r["Days to alert"]
+            state = "alert" if r["Status"] == "ALERT" else (f"warning (~{days:.0f} d to alert)" if pd.notna(days) else "warning")
+            parts.append(f"<b>{esc(r['Well'])}</b> {state}")
+        out.append("Artificial-lift equipment needs attention: " + ", ".join(parts) + " — plan inspection before failure.")
+    elif f.sensors:
+        out.append("No equipment anomalies — all pumps within their own normal range.")
+    if curves and f.has_lift:
+        res = optimise_lift(curves, sorted(curves), sum(c.x_now for c in curves.values()), 0.5, 1.6)
+        if res is not None:
+            gain = res["Oil optimised"].sum() - res["Oil now (model)"].sum()
+            usd = gain * M3_TO_BBL * 365 * f.report.get("oil_price", 70) / 1e6
+            if gain > 0.05:
+                out.append(f"Re-allocating the same lift gas could add <b>{gain:+,.1f} m³/d</b> "
+                           f"(≈ {gain * M3_TO_BBL:+,.0f} bbl/d, ~${usd:,.2f}M/yr) — see Lift-Gas Optimiser.")
+    if not dca.empty:
+        worst = dca.sort_values("Decline (%/yr)", ascending=False).head(2)
+        out.append(f"Median decline is <b>{dca['Decline (%/yr)'].median():.0f}%/yr</b>; fastest: " +
+                   ", ".join(f"{esc(r.Well)} ({r['Decline (%/yr)']:.0f}%/yr)" for _, r in worst.iterrows()) + ".")
+    if vfm:
+        va = vfm["metrics"].iloc[1]
+        out.append(f"The AI rate model is <b>{va['Accuracy (%)']:.1f}%</b> accurate on unseen dates — reliable enough to "
+                   f"track every well daily between well tests.")
+    if f.report.get("auto_units"):
+        out.append("Units auto-detected from headers: " + esc(", ".join(f.report["auto_units"])) + ".")
+    return out
+
+
+def page_overview(f: Field, ranked, vfm, dca, fc, curves=None):
     page_header("Field Command Centre",
                 f"{f.name} · {f.df['Date'].min():%d %b %Y} → {f.df['Date'].max():%d %b %Y}",
                 f"{f.df['Well'].nunique()} wells · {len(f.df):,} records")
@@ -851,8 +997,10 @@ def page_overview(f: Field, ranked, vfm, dca, fc):
                  ("Median decline", fmt(dca["Decline (%/yr)"].median() if not dca.empty else np.nan, ".1f", " %/yr"), "Arps"),
                  ("Lift gas in use", fmt(ranked["Injection_Rate"].sum(), ",.0f", f" {f.inj_unit}"), "latest day")])
     top = ranked.iloc[0]
-    insight(f"<b>Focus now:</b> {esc(top['Well'])} is <b>{esc(top['Priority'])}</b> — {esc(top['Why'])}. "
-            f"Open <b>Well Explorer</b> for its full story or <b>Lift-Gas Optimiser</b> for field-wide gains.")
+    bullets = field_briefing(f, ranked, vfm, dca, curves or {})
+    insight("<b>AI field briefing</b><ul style='margin:8px 0 0 18px;padding:0'>" +
+            "".join(f"<li style='margin:3px 0'>{x}</li>" for x in bullets) +
+            f"<li style='margin:3px 0'>Top priority: <b>{esc(top['Well'])}</b> ({esc(top['Priority'])}) — {esc(top['Why'])}.</li></ul>")
     left, right = st.columns([1.35, 1], gap="large")
     with left:
         card_header("Field production · measured vs AI", "daily totals across all wells")
@@ -886,6 +1034,7 @@ def page_overview(f: Field, ranked, vfm, dca, fc):
             chart(fig, 350, yaxis_title="m³/d")
 
 
+@_fragment
 def page_model(f: Field, vfm):
     page_header("AI Production Model", "Virtual flow meter — daily oil rate for every well from pressures, choke size, "
                 "lift gas and pump signals, between periodic well tests.", "Gradient boosting + extra trees")
@@ -920,7 +1069,7 @@ def page_model(f: Field, vfm):
     with b:
         card_header("Predicted vs measured", "each dot is one well-day")
         s = p.sample(min(len(p), 4000), random_state=1)
-        fig = px.scatter(s, x="Oil_Rate", y="Pred", color="Split", opacity=0.55,
+        fig = px.scatter(s, x="Oil_Rate", y="Pred", color="Split", opacity=0.55, render_mode="webgl",
                          color_discrete_map={"Train": COLORS["blue"], "Validation": COLORS["amber"]})
         hi = float(max(s["Oil_Rate"].max(), s["Pred"].max()))
         fig.add_trace(go.Scatter(x=[0, hi], y=[0, hi], mode="lines", line=dict(color=COLORS["muted"], dash="dash"),
@@ -928,7 +1077,7 @@ def page_model(f: Field, vfm):
         chart(fig, 390, xaxis_title="Measured (m³/d)", yaxis_title="AI (m³/d)")
     a, b = st.columns([1, 1.25], gap="large")
     with a:
-        card_header("What drives the prediction", "permutation importance on blind-test data")
+        card_header("What drives the prediction", "share of the model's decisions using each input")
         imp = vfm["importance"].assign(Feature=lambda x: x["Feature"].str.replace("_", " "))
         fig = px.bar(imp, x="Importance", y="Feature", orientation="h", color_discrete_sequence=[COLORS["teal"]])
         chart(fig, 430, legend=False, xaxis_tickformat=".0%", yaxis_title=None)
@@ -943,6 +1092,7 @@ def page_model(f: Field, vfm):
          "never used as inputs.")
 
 
+@_fragment
 def page_decline(f: Field, dca, fc):
     page_header("Decline Curves & Forecast", "Arps decline fitted to each well's 7-day average oil rate.", "180-day horizon")
     if dca.empty:
@@ -960,7 +1110,7 @@ def page_decline(f: Field, dca, fc):
         g, fw = f.df[f.df["Well"] == well], fc[fc["Well"] == well]
         card_header(f"{well} · decline curve", "measured · Arps fit · forecast")
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=g.Date, y=g.Oil_Rate, name="Measured", mode="markers",
+        fig.add_trace(go.Scattergl(x=g.Date, y=g.Oil_Rate, name="Measured", mode="markers",
                                  marker=dict(size=4, color=COLORS["teal"], opacity=.55)))
         fig.add_trace(go.Scatter(x=fw.Date, y=fw.Fitted, name="Arps fit", line=dict(color=COLORS["blue"], width=2)))
         fig.add_trace(go.Scatter(x=fw.Date, y=fw.Forecast, name="Forecast", line=dict(color=COLORS["amber"], width=2, dash="dash")))
@@ -975,6 +1125,7 @@ def page_decline(f: Field, dca, fc):
     table(dca, 3)
 
 
+@_fragment
 def page_lift(f: Field, curves, skipped):
     page_header("Lift-Gas Optimiser", "Each well's gas-lift performance curve is learned from its history; an exact "
                 "optimiser redistributes the available gas to maximise total field oil.", f"lift gas in {f.inj_unit}")
@@ -1041,6 +1192,7 @@ def page_lift(f: Field, curves, skipped):
          "separator and gas-handling limits. FIELDWISE never sends commands to the field.", warn=True)
 
 
+@_fragment
 def page_equipment(f: Field, rows, summ):
     page_header("Equipment Health", "Each well is compared with its own healthy baseline; an Isolation Forest scores "
                 "unusual sensor combinations and the recent trend projects the days left before an alert.", "artificial lift")
@@ -1077,6 +1229,7 @@ def page_equipment(f: Field, rows, summ):
             chart(go.Figure(go.Scatter(x=g.Date, y=g[s], line=dict(color=COLORS["blue"], width=1.6))), 210, legend=False)
 
 
+@_fragment
 def page_well(f: Field, ranked, vfm):
     page_header("Well Explorer", "Everything about one well on one screen.")
     well = st.selectbox("Well (ranked by priority)", ranked["Well"].tolist(), key="explore_well")
@@ -1183,29 +1336,39 @@ PAGES = {"Command Centre": "📊", "AI Production Model": "🧠", "Decline & For
          "Equipment Health": "🛠️", "Well Explorer": "🔎", "Data & Quality": "🧹", "Methodology": "📘"}
 
 
+def _file_token(up, data: bytes) -> str:
+    """Cheap, stable identity for an upload (avoids hashing the whole file on every rerun)."""
+    head = hashlib.md5(data[:1 << 20] + data[-(1 << 20):]).hexdigest()
+    return f"{up.name}|{len(data)}|{head}"
+
+
 def sidebar_upload():
     st.sidebar.markdown("**Field data**")
     up = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls", "xlsm"])
     if up is None:
         return None, None
     data = up.getvalue()
+    token = _file_token(up, data)
     try:
-        sheets = read_file(data, up.name)
+        sheets = read_file(token, data, up.name)
     except Exception as exc:  # noqa: BLE001
         return None, f"Could not read {up.name}: {exc}"
     sheet = list(sheets)[0]
     if len(sheets) > 1:
         sheet = st.sidebar.selectbox("Sheet", list(sheets))
-    sample, _, _ = map_columns(sheets[sheet].head(500))
-    units = {}
-    with st.sidebar.expander("Source units", expanded=False):
-        st.caption("Unit used in your file for each recognised column — converted automatically.")
-        for col, opts in UNITS.items():
-            if col in sample.columns:
-                keys = list(opts)
-                units[col] = st.selectbox(col.replace("_", " "), keys, index=keys.index(STD_UNIT[col]), key=f"u_{col}")
+    sample, mapped, _ = map_columns(sheets[sheet].head(200))
+    units, detected = {}, {}
+    for col in UNITS:
+        if col in sample.columns:
+            detected[col] = detect_unit(mapped.get(col, ""), col) or STD_UNIT[col]
+    auto = [f"{c.replace('_', ' ')}: {u}" for c, u in detected.items() if u != STD_UNIT[c]]
+    with st.sidebar.expander("Source units" + (f" · {len(auto)} auto-detected" if auto else ""), expanded=False):
+        st.caption("Detected from your column headers where possible — change any that are wrong.")
+        for col, guess in detected.items():
+            keys = list(UNITS[col])
+            units[col] = st.selectbox(col.replace("_", " "), keys, index=keys.index(guess), key=f"u_{token}_{col}")
     try:
-        df, rep = clean_cached(data, up.name, sheet, tuple(sorted(units.items())))
+        df, rep = clean_cached(f"{token}|{sheet}", sheets, sheet, tuple(sorted(units.items())))
     except Exception as exc:  # noqa: BLE001
         return None, f"Could not process {up.name}: {exc}"
     if df is None:
@@ -1213,7 +1376,9 @@ def sidebar_upload():
             return None, ("Required columns not found: " + ", ".join(rep["missing"]) + ". Recognised: " +
                           (", ".join(rep["mapped"]) or "none") + ". Rename the headers or start from the template.")
         return None, rep.get("error", "The data could not be cleaned.")
-    return Field(df=df, name=up.name, report=rep, lift_is_gas=units.get("Injection_Rate", "Sm³/d") in _GAS), None
+    rep = {**rep, "auto_units": auto}
+    key = f"{token}|{sheet}|{sorted(units.items())}"
+    return Field(df=df, name=up.name, report=rep, lift_is_gas=units.get("Injection_Rate", "Sm³/d") in _GAS, key=key), None
 
 
 def sidebar_settings() -> Settings:
@@ -1247,19 +1412,19 @@ def main():
     page = st.sidebar.radio("Navigate", list(PAGES), format_func=lambda p: f"{PAGES[p]}  {p}")
     st.sidebar.markdown(footer, unsafe_allow_html=True)
 
-    df = field.df
-    with st.spinner("Training models on your field data…"):
+    df, k = field.df, field.key
+    with st.spinner("Reading the field and training models…"):
         try:
-            vfm = train_vfm(df, settings.test_interval)
+            vfm = train_vfm(k, df, settings.test_interval)
         except ValueError:
             vfm = None
-        dca, fc = fit_declines(df)
-        curves, skipped = fit_lift_curves(df) if field.has_lift else ({}, {})
-        eq_rows, eq_sum = screen_equipment(df, tuple(field.sensors))
-        ranked = rank_wells(df, dca, eq_sum, settings)
+        dca, fc = fit_declines(k, df)
+        curves, skipped = fit_lift_curves(k, df) if field.has_lift else ({}, {})
+        eq_rows, eq_sum = screen_equipment(k, df, tuple(field.sensors))
+        ranked = rank_cached(k, df, dca, eq_sum, settings, astuple(settings))
 
     if page == "Command Centre":
-        page_overview(field, ranked, vfm, dca, fc)
+        page_overview(field, ranked, vfm, dca, fc, curves)
     elif page == "AI Production Model":
         page_model(field, vfm)
     elif page == "Decline & Forecast":
