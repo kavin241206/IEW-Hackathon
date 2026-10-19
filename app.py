@@ -413,7 +413,13 @@ def _arps(t, qi, di, b):
 @st.cache_data(show_spinner=False, max_entries=3)
 def fit_declines(df: pd.DataFrame, horizon: int = 180):
     params, curves = [], []
+    notes = {}
     for well, g in df.sort_values("Date").groupby("Well", sort=True):
+        if "Choke_Size" in g.columns:   # a bean change starts a new decline segment
+            change = np.flatnonzero(g["Choke_Size"].diff().fillna(0).to_numpy() != 0)
+            if len(change) and len(g) - change[-1] >= 30:
+                g = g.iloc[change[-1]:]
+                notes[well] = f"fitted since choke change on {g['Date'].iloc[0]:%d %b %Y}"
         s = g.set_index("Date")["Oil_Rate"].rolling(7, min_periods=1).mean()
         t = (s.index - s.index[0]).total_seconds().to_numpy() / 86400
         y = s.to_numpy()
@@ -432,7 +438,7 @@ def fit_declines(df: pd.DataFrame, horizon: int = 180):
         qf = _arps(tf, qi, di, b)
         params.append({"Well": well, "Current rate (m³/d)": float(_arps(t[-1], qi, di, b)), "b-factor": b,
                        "Decline (%/yr)": 100 * (1 - np.power(1 + b * d_now * 365, -1 / b)),
-                       "Next 180 d (m³)": float(qf.sum()), "Fit R²": r2})
+                       "Next 180 d (m³)": float(qf.sum()), "Fit R²": r2, "Basis": notes.get(well, "full history")})
         curves.append(pd.DataFrame({"Well": well, "Date": s.index, "Fitted": fit}))
         curves.append(pd.DataFrame({"Well": well, "Date": s.index[-1] + pd.to_timedelta(np.arange(1, horizon + 1), "D"),
                                     "Forecast": qf}))
@@ -460,8 +466,9 @@ class LiftCurve:
                           + self.beta[4] * self.choke_now, 0.0)
 
     def marginal(self, inj):
+        """Extra oil (m³/d) per 1,000 units of lift gas at this setting."""
         x = np.asarray(inj, float) / self.scale
-        return (self.beta[1] + 2 * self.beta[2] * x) / self.scale
+        return (self.beta[1] + 2 * self.beta[2] * x) / self.scale * 1000
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -496,6 +503,9 @@ def fit_lift_curves(df: pd.DataFrame, window: int = 150):
 
 
 # ---- 3d. Equipment health ------------------------------------------------------------
+Z_ALERT, Z_WARN = 4.0, 2.5   # robust σ from the well's own healthy baseline
+
+
 @st.cache_data(show_spinner=False, max_entries=3)
 def screen_equipment(df: pd.DataFrame, sensors: tuple):
     """Per-well robust z-scores vs own baseline → Isolation Forest → alert + early warning (trend to threshold)."""
@@ -525,14 +535,20 @@ def screen_equipment(df: pd.DataFrame, sensors: tuple):
     rows = []
     for well, g in d.groupby("Well", sort=True):
         now = float(g["Score"].tail(3).mean())
-        tail = g.tail(14)
+        tail = g.tail(10)
         slope = np.polyfit(np.arange(len(tail)), tail["Score"].to_numpy(), 1)[0] if len(tail) > 4 else 0.0
         days_to = (thr - now) / slope if (slope > 1e-6 and now < thr) else np.nan
         zl = g[zcols].tail(3).mean()
         drv = zl.abs().idxmax()
-        status = "ALERT" if now > thr else ("EARLY WARNING" if np.isfinite(days_to) and days_to <= 21 else "NORMAL")
+        z_now = float(abs(zl[drv]))
+        z_slope = np.polyfit(np.arange(len(tail)), tail[drv].abs().to_numpy(), 1)[0] if len(tail) > 4 else 0.0
+        rising = (np.isfinite(days_to) and days_to <= 14 and now >= calm + 0.7 * (thr - calm)) or \
+                 (z_now >= Z_WARN and z_slope > 0)
+        status = "ALERT" if (now > thr or z_now >= Z_ALERT) else ("EARLY WARNING" if rising else "NORMAL")
+        if status == "EARLY WARNING" and not np.isfinite(days_to) and z_slope > 0:
+            days_to = (Z_ALERT - z_now) / z_slope
         rows.append({"Well": well, "Status": status,
-                     "Health": float(np.clip(100 * (1 - (now - calm) / max(thr - calm, 1e-9)), 0, 100)),
+                     "Health": float(np.clip(min(100 * (1 - (now - calm) / max(thr - calm, 1e-9)), 100 * (1 - z_now / Z_ALERT)), 0, 100)),
                      "Days to alert": days_to, "Main signal": f"{drv[2:].replace('_', ' ')} {zl[drv]:+.1f}σ",
                      "Score": now})
     return d, pd.DataFrame(rows).assign(Threshold=thr)
@@ -547,6 +563,7 @@ class Settings:
     decline_high: float = 30.0
     test_interval: int = 14
     co2: float = GRID_CO2
+    oil_price: float = 70.0
 
 
 def rank_wells(df, dca, eq, s: Settings) -> pd.DataFrame:
@@ -626,7 +643,7 @@ def optimise_lift(curves: dict, wells: list, budget: float, min_frac: float, max
         new_inj = float(lv[i] * unit)
         rows.append({"Well": w, "Current lift gas": c.x_now, "Optimised lift gas": new_inj,
                      "Oil now (model)": float(c.oil(c.x_now)), "Oil optimised": float(val[i]),
-                     "Δ Oil": float(val[i] - c.oil(c.x_now)), "Marginal gain": float(c.marginal(new_inj)),
+                     "Δ Oil": float(val[i] - c.oil(c.x_now)), "Marginal gain / 1k gas": float(c.marginal(new_inj)),
                      "Curve": c.shape})
     return pd.DataFrame(rows)
 
@@ -985,7 +1002,8 @@ def page_lift(f: Field, curves, skipped):
     kpi_row([("Oil · current allocation", f"{now:,.1f} m³/d", "model basis"),
              ("Oil · optimised", f"{new:,.1f} m³/d", "same gas limit", "good"),
              ("Extra oil", f"{new - now:+,.1f} m³/d", f"≈ {(new - now) * M3_TO_BBL:+,.0f} bbl/d", "good" if new >= now else "bad"),
-             ("Uplift", f"{(new / now - 1) * 100 if now else 0:+.1f}%", "field oil"),
+             ("Annual value", f"${(new - now) * M3_TO_BBL * 365 * f.report.get('oil_price', 70) / 1e6:+,.2f}M",
+              f"at ${f.report.get('oil_price', 70):,.0f}/bbl · {(new / now - 1) * 100 if now else 0:+.1f}% oil", "good" if new >= now else "bad"),
              ("Gas used", f"{res['Optimised lift gas'].sum():,.0f}", f"of {budget:,.0f} {f.inj_unit}")])
     move = (res["Optimised lift gas"] - res["Current lift gas"])
     give, take = res.loc[move.idxmin()], res.loc[move.idxmax()]
@@ -1014,7 +1032,7 @@ def page_lift(f: Field, curves, skipped):
         fig.add_trace(go.Bar(x=res.Well, y=res["Current lift gas"], name="Current", marker_color=COLORS["muted"]))
         fig.add_trace(go.Bar(x=res.Well, y=res["Optimised lift gas"], name="Optimised", marker_color=COLORS["teal"]))
         chart(fig, 410, barmode="group", yaxis_title=f"Lift gas ({f.inj_unit})")
-    card_header("Recommendation table", "marginal gain = extra m³/d oil per unit of gas at the new setting")
+    card_header("Recommendation table", "marginal gain = extra m³/d of oil per additional 1,000 units of lift gas")
     table(res, 3)
     if skipped:
         st.caption("Held at current settings: " + "; ".join(f"{w} ({r})" for w, r in skipped.items()))
@@ -1032,7 +1050,7 @@ def page_equipment(f: Field, rows, summ):
         return
     n_a, n_w = int((summ.Status == "ALERT").sum()), int((summ.Status == "EARLY WARNING").sum())
     kpi_row([("Alerts", n_a, "anomalous now", "bad" if n_a else "good"),
-             ("Early warnings", n_w, "trend reaches alert ≤ 21 days", "warn" if n_w else "good"),
+             ("Early warnings", n_w, "trend reaches alert ≤ 14 days", "warn" if n_w else "good"),
              ("Healthy wells", int((summ.Status == "NORMAL").sum()), f"of {len(summ)}"),
              ("Signals used", len(f.sensors), ", ".join(s.split("_")[-1].lower() for s in f.sensors))])
     a, b = st.columns([1, 1.35], gap="large")
@@ -1200,12 +1218,13 @@ def sidebar_upload():
 
 def sidebar_settings() -> Settings:
     with st.sidebar.expander("Settings", expanded=False):
-        return Settings(test_interval=st.select_slider("Well-test interval (observations)", [7, 14, 21, 30], 14),
+        return Settings(test_interval=st.select_slider("Well-test interval (observations)", options=[7, 14, 21, 30], value=14),
                         wc_watch=st.slider("Water cut · watch (%)", 30, 95, 70),
                         wc_high=st.slider("Water cut · high (%)", 50, 99, 90),
                         decline_watch=st.slider("Decline · watch (%/yr)", 5, 50, 15),
                         decline_high=st.slider("Decline · high (%/yr)", 10, 80, 30),
-                        co2=st.number_input("Grid CO₂ factor (kg/kWh)", 0.0, 2.0, GRID_CO2, 0.01))
+                        co2=st.number_input("Grid CO₂ factor (kg/kWh)", min_value=0.0, max_value=2.0, value=GRID_CO2, step=0.01),
+                        oil_price=st.number_input("Oil price (USD/bbl)", min_value=0.0, max_value=300.0, value=70.0, step=1.0))
 
 
 def main():
@@ -1224,7 +1243,7 @@ def main():
         return
 
     settings = sidebar_settings()
-    field.report = {**field.report, "interval": settings.test_interval, "co2": settings.co2}
+    field.report = {**field.report, "interval": settings.test_interval, "co2": settings.co2, "oil_price": settings.oil_price}
     page = st.sidebar.radio("Navigate", list(PAGES), format_func=lambda p: f"{PAGES[p]}  {p}")
     st.sidebar.markdown(footer, unsafe_allow_html=True)
 
