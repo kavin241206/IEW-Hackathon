@@ -402,12 +402,411 @@ def clean_data(raw: pd.DataFrame, unit_choices: dict, mapping: dict | None = Non
     return frame, rep
 
 
+# ---- 2b. AUTO-STRUCTURING — turn any sheet layout into one tidy table (one row = one well on one date) ----
+_UNIT_TOKEN = re.compile(
+    r"^[\(\[]?\s*(bbl|stb|bopd|bwpd|blpd|m3|m³|sm3|sm³|nm3|scf|mscf|mmscf|mmscfd|mcf|psi|psig|psia|bar|barg|bara|"
+    r"kpa|mpa|kgf|kg/cm2|°c|°f|degc|degf|c|f|hz|rpm|a|amp|amps|ma|kwh|mwh|wh|mm/s|in/s|%|frac|fraction|in|inch|"
+    r"mm|/64|64ths|1/64|d|day|days|hr|h|unit|units)\b", re.I)
+_LABEL_ROW = re.compile(r"^\s*(well(?:\s*(?:name|id|no\.?|number))?|asset|wellbore|string)\s*[:=#\-–]\s*(.+?)\s*$", re.I)
+_TOTAL_ROW = re.compile(r"^\s*(grand\s+)?(total|sum|average|avg|mean|subtotal|cumulative)\b", re.I)
+_WELL_TOKEN = r"(?:[A-Za-z]{1,8}[-_ #]?\d{1,4}[A-Za-z]?|well\s*[-_#]?\s*\d{1,4})"
+_NOT_WELL = re.compile(r"^\s*(co2|h2s|n2|o2|h2o|so2|no2|nox|ch4|c[1-9]\+?|pm\d+|q[1-4]|h[12]|fy\s*\d+|"
+                       r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s*[-_ ]?\s*\d{2,4}|"
+                       r"[a-z]+\s*[-_ ]?\s*(19|20)\d\d|col_\d+|unnamed.*)\s*$", re.I)
+_WELL_ONLY_RX = re.compile(rf"^\s*{_WELL_TOKEN}\s*$", re.I)
+
+
+class _WellOnly:
+    @staticmethod
+    def match(s):
+        return bool(_WELL_ONLY_RX.match(str(s))) and not _NOT_WELL.match(str(s))
+
+
+_WELL_ONLY = _WellOnly()
+_WELL_FIRST = re.compile(rf"^\s*({_WELL_TOKEN})\s*[-_:|/.]+\s*(.+?)\s*$", re.I)
+_WELL_LAST = re.compile(rf"^\s*(.+?)\s*[-_:|/.]+\s*({_WELL_TOKEN})\s*$", re.I)
+_WELL_SPACE_FIRST = re.compile(rf"^\s*({_WELL_TOKEN})\s+(.+?)\s*$", re.I)
+
+
+def _is_number(x) -> bool:
+    if isinstance(x, (int, float, np.integer, np.floating)) and not isinstance(x, bool):
+        return np.isfinite(x)
+    try:
+        float(str(x).replace(",", "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_dateish(x) -> bool:
+    if isinstance(x, (pd.Timestamp, np.datetime64)) or hasattr(x, "year"):
+        return True
+    s = str(x).strip()
+    return bool(re.match(r"^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}", s) or
+                re.match(r"^\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{2,4}", s) or re.match(r"^[A-Za-z]{3,9}[-\s]\d{2,4}$", s))
+
+
+def _row_profile(row) -> tuple:
+    """(fill fraction, header-likeness, data-likeness) of one row."""
+    vals = [v for v in row if pd.notna(v) and str(v).strip() != ""]
+    if not vals:
+        return 0.0, 0.0, 0.0
+    dates = sum(1 for v in vals if _is_dateish(v))
+    text = sum(1 for v in vals if not _is_number(v) and not _is_dateish(v))
+    num = sum(1 for v in vals if _is_number(v)) + dates
+    headerish = text / len(vals)
+    if len(vals) >= 5 and dates / len(vals) > 0.7:     # a row of dates = header of a transposed sheet
+        headerish = max(headerish, dates / len(vals))
+    return len(vals) / len(row), headerish, num / len(vals)
+
+
+def _str_matrix(df: pd.DataFrame) -> np.ndarray:
+    """All cells as stripped strings ('' for empty) — column-wise, so it stays fast on large sheets."""
+    return np.column_stack([df[c].astype(str).str.strip().where(df[c].notna(), "").to_numpy()
+                            for c in df.columns]) if df.shape[1] else np.empty((len(df), 0), dtype=object)
+
+
+def _first_cells(sv: np.ndarray, k: int = 2) -> list:
+    """First k non-empty cells of every row (vectorised)."""
+    out, mask = [], sv != ""
+    rows = np.arange(len(sv))
+    for _ in range(k):
+        has = mask.any(axis=1)
+        idx = mask.argmax(axis=1)
+        out.append(pd.Series(np.where(has, sv[rows, idx], ""), dtype=str))
+        mask = mask.copy()
+        mask[rows, idx] = False
+    return out
+
+
+def _find_header(grid: pd.DataFrame, log: list, where: str):
+    """Locate the header row (skipping titles/blank lines), a units row below it, or a two-level header."""
+    g = grid.dropna(how="all").dropna(axis=1, how="all")
+    if g.empty:
+        return None
+    g = g.reset_index(drop=True)
+    g.columns = range(g.shape[1])
+    # Section labels such as "Well: W-001" above each block → carried down as the well ID
+    sv = _str_matrix(g)
+    first_cell = _first_cells(sv, 1)[0].set_axis(g.index)
+    n_cells = pd.Series((sv != "").sum(axis=1), index=g.index)
+    lab = first_cell.str.extract(_LABEL_ROW)[1].where(n_cells <= 2)
+    bare = first_cell.where((n_cells == 1) & first_cell.map(_WELL_ONLY.match))   # a lone "W-001" line
+    lab = lab.fillna(bare) if bare.notna().sum() >= 2 else lab
+    block_well = None
+    if lab.notna().sum() >= 2:
+        block_well = lab.ffill()
+        g = g[lab.isna()]
+        log.append(f"{where}: found {lab.notna().sum()} section labels (e.g. '{first_cell[lab.notna()].iloc[0]}') "
+                   "— used them as the well ID for the rows below each label")
+    head = g.head(40)
+    profiles = [_row_profile(r) for r in head.itertuples(index=False)]
+    best, best_score = 0, -1.0
+    for i, (fill, text, _) in enumerate(profiles):
+        below = [p[2] if p[1] < 0.7 else 0.3 for p in profiles[i + 1:i + 6] if p[0] > 0]
+        data_below = np.mean(below) if below else 0
+        score = fill * text * (0.4 + data_below) - 0.002 * i
+        if fill >= 0.4 and text >= 0.5 and score > best_score:
+            best, best_score = i, score
+    names = [str(v).strip() if pd.notna(v) and str(v).strip() else "" for v in g.iloc[best]]
+    start = best + 1
+    # Two-level header where the upper level is sparse (merged cells, e.g. well names above Oil/Water/Gas)
+    if best > 0:
+        up = [str(v).strip() if pd.notna(v) and str(v).strip() else "" for v in g.iloc[best - 1]]
+        filled = [j for j, v in enumerate(up) if v]
+        if len(filled) >= 2 and min(filled) > 0 and all(not _is_number(up[j]) for j in filled) \
+                and len({up[j] for j in filled}) >= 2:
+            top = pd.Series(up).replace("", np.nan).ffill().fillna("").tolist()
+            names = [f"{t} | {n}" if t and n and t != n else (n or t) for t, n in zip(top, names)]
+            log.append(f"{where}: combined a two-level header (e.g. well name over measurement)")
+            best -= 1
+    if best > 0:
+        log.append(f"{where}: skipped {best} title/blank row(s) above the header")
+    # Units row directly under the header (e.g. 'bbl/d', 'psi') → merge into names
+    if start < len(g):
+        nxt = [v for v in g.iloc[start] if pd.notna(v) and str(v).strip()]
+        if nxt and sum(bool(_UNIT_TOKEN.match(str(v).strip())) for v in nxt) / len(nxt) >= 0.5:
+            units = [str(v).strip() if pd.notna(v) else "" for v in g.iloc[start]]
+            names = [f"{n} ({u.strip('()[]')})" if n and u else (n or u) for n, u in zip(names, units)]
+            start += 1
+            log.append(f"{where}: merged a units row into the column names")
+        # Two-level header: a sparse top row (merged cells, e.g. well names) above a full row of labels
+        elif start < len(g) and best_score > 0:
+            fill2, text2, _ = _row_profile(g.iloc[start])
+            fill1 = profiles[best][0]
+            if text2 >= 0.6 and fill2 > fill1 + 0.15:
+                top = pd.Series(names).replace("", np.nan).ffill().fillna("").tolist()
+                sub = [str(v).strip() if pd.notna(v) else "" for v in g.iloc[start]]
+                names = [f"{t} | {s}" if t and s and t != s else (s or t) for t, s in zip(top, sub)]
+                start += 1
+                log.append(f"{where}: combined a two-level header (e.g. well name over measurement)")
+    names = [n or f"col_{j}" for j, n in enumerate(names)]
+    seen = {}
+    for j, n in enumerate(names):                     # de-duplicate names
+        if n in seen:
+            seen[n] += 1
+            names[j] = f"{n}.{seen[n]}"
+        else:
+            seen[n] = 0
+    data = g.iloc[start:].copy()
+    g_index = data.index  # noqa: F841 — original positions kept so section labels can be re-attached
+    data.columns = names
+    # Remove repeated header lines, totals/averages rows and empty rows
+    first = data.columns[0]
+    dsv = _str_matrix(data)
+    is_rep = pd.Series((dsv == np.array(names, dtype=object)).mean(axis=1) > 0.6, index=data.index)
+    c1, c2 = _first_cells(dsv, 2)
+    is_tot = pd.Series((c1.str.match(_TOTAL_ROW) | c2.str.match(_TOTAL_ROW)).to_numpy(), index=data.index)
+    if is_rep.any():
+        log.append(f"{where}: removed {int(is_rep.sum())} repeated header row(s)")
+    if is_tot.any():
+        log.append(f"{where}: removed {int(is_tot.sum())} total/average row(s)")
+    data = data[~is_rep & ~is_tot].dropna(how="all")
+    if block_well is not None and "Well" not in data.columns:
+        data.insert(0, "Well", block_well.reindex(data.index).astype(str).str.strip())
+    data = data.loc[:, [c for c in data.columns if data[c].notna().any() and not str(c).startswith("col_")]
+                    or list(data.columns)]
+    _ = first
+    return data.reset_index(drop=True)
+
+
+def _coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+    """Numbers stored as text → numbers (only when most values parse)."""
+    out = df.copy()
+    for c in out.columns:
+        s = out[c]
+        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+            continue
+        num = pd.to_numeric(s.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+        if s.notna().sum() and num.notna().sum() / s.notna().sum() >= 0.8:
+            out[c] = num
+    return out
+
+
+def smart_dates(s: pd.Series):
+    """Parse dates robustly: Excel serial numbers, day-first vs month-first detection, mixed formats.
+    Returns (parsed series, description)."""
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return s, "native dates"
+    nn = s.dropna()
+    if len(nn) and nn.map(lambda x: isinstance(x, pd.Timestamp) or hasattr(x, "isoformat")).mean() > 0.9:
+        return pd.to_datetime(s, errors="coerce"), "native dates"
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() > 0.9 and num.between(20000, 80000).mean() > 0.9:
+        return pd.to_datetime(num, unit="D", origin="1899-12-30"), "Excel serial numbers"
+    if num.notna().mean() > 0.9 and num.between(1900, 2100).mean() > 0.9:
+        return pd.to_datetime(num.astype("Int64").astype(str), format="%Y", errors="coerce"), "years"
+    txt = s.astype(str).str.strip()
+    parts = txt.str.extract(r"^(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})")
+    dayfirst = None
+    if parts.notna().all(axis=1).mean() > 0.5:
+        a, b = pd.to_numeric(parts[0], errors="coerce"), pd.to_numeric(parts[1], errors="coerce")
+        if (a > 12).any() and not (b > 12).any():
+            dayfirst = True
+        elif (b > 12).any() and not (a > 12).any():
+            dayfirst = False
+        else:
+            dayfirst = True   # ambiguous everywhere → international convention (dd/mm)
+    try:
+        out = pd.to_datetime(txt, errors="coerce", format="mixed", dayfirst=bool(dayfirst))
+    except (TypeError, ValueError):
+        out = pd.to_datetime(txt, errors="coerce", dayfirst=bool(dayfirst))
+    how = {True: "day-first (dd/mm)", False: "month-first (mm/dd)", None: "text dates"}[dayfirst]
+    return out, how
+
+
+def _date_column(df: pd.DataFrame):
+    m, _ = infer_columns(df)
+    if "Date" in m:
+        return m["Date"]
+    for c in df.columns:
+        if df[c].notna().any() and df[c].dropna().head(50).map(_is_dateish).mean() > 0.8:
+            return c
+    return None
+
+
+def _build_date(df: pd.DataFrame, log: list, where: str) -> pd.DataFrame:
+    """Year / Month / Day columns → one Date column."""
+    low = {_norm(c): c for c in df.columns}
+    y = next((low[k] for k in ("year", "yr", "yyyy") if k in low), None)
+    mth = next((low[k] for k in ("month", "mon", "mm", "month name") if k in low), None)
+    if y is None or mth is None:
+        return df
+    dcol = next((low[k] for k in ("day", "dd") if k in low), None)
+    months = pd.to_numeric(df[mth], errors="coerce")
+    if months.isna().mean() > 0.5:
+        months = pd.to_datetime(df[mth].astype(str).str[:3], format="%b", errors="coerce").dt.month
+    day = pd.to_numeric(df[dcol], errors="coerce").fillna(1) if dcol else 1
+    df = df.copy()
+    df["Date"] = pd.to_datetime(dict(year=pd.to_numeric(df[y], errors="coerce"), month=months, day=day), errors="coerce")
+    log.append(f"{where}: built Date from {', '.join(str(c) for c in (y, mth, dcol) if c is not None)} columns")
+    return df.drop(columns=[c for c in (y, mth, dcol) if c is not None])
+
+
+def _split_well_header(name: str):
+    """'W-001 Oil (bbl/d)' → ('W-001', 'Oil (bbl/d)');  'Oil | W-001' → ('W-001', 'Oil')."""
+    s = str(name)
+    if " | " in s:
+        a, b = [p.strip() for p in s.split(" | ", 1)]
+        if _WELL_ONLY.match(a):
+            return a, b
+        if _WELL_ONLY.match(b):
+            return b, a
+    for rx, wi, mi in ((_WELL_FIRST, 1, 2), (_WELL_LAST, 2, 1), (_WELL_SPACE_FIRST, 1, 2)):
+        m = rx.match(s)
+        if m and not _WELL_ONLY.match(m.group(mi)) and not _NOT_WELL.match(m.group(wi)):
+            measure = m.group(mi)
+            if _LOOKUP.get(_strip_units(measure)) or any(w in _strip_units(measure) for _, ws in _KEYWORDS for w in ws):
+                return m.group(wi), measure
+    if _WELL_ONLY.match(s):
+        return s.strip(), None
+    return None, None
+
+
+def _unpivot_wide(df: pd.DataFrame, log: list, where: str, measure_name: str) -> pd.DataFrame:
+    """Columns like 'W-001 Oil', 'W-002 Oil' (or just 'W-001', 'W-002') → rows with a Well column."""
+    m, _ = infer_columns(df)
+    if "Well" in m and m["Well"] in df.columns and not _WELL_ONLY.match(str(m["Well"])):
+        return df
+    parsed = {c: _split_well_header(c) for c in df.columns}
+    wide = {c: p for c, p in parsed.items() if p[0]}
+    wells = {p[0].upper() for p in wide.values()}
+    if len(wells) < 2 or len(wide) < 2:
+        return df
+    ids = [c for c in df.columns if c not in wide]
+    parts = []
+    for well in sorted(wells, key=str):
+        cols = {c: (p[1] or measure_name) for c, p in wide.items() if p[0].upper() == well}
+        part = df[ids + list(cols)].rename(columns=cols).copy()
+        part.insert(0, "Well", well.replace("_", "-").replace(" ", "-").upper())
+        parts.append(part)
+    out = pd.concat(parts, ignore_index=True)
+    meas = sorted({str(p[1] or measure_name) for p in wide.values()})
+    log.append(f"{where}: wide layout — unpivoted {len(wells)} wells × {len(meas)} measure(s) "
+               f"({', '.join(meas[:5])}{'…' if len(meas) > 5 else ''}) into rows")
+    return out
+
+
+def _maybe_transpose(df: pd.DataFrame, log: list, where: str) -> pd.DataFrame:
+    """Dates running across the top (one row per well/measure) → dates down the side."""
+    heads = list(df.columns[1:])
+    if len(heads) >= 5 and np.mean([_is_dateish(h) for h in heads]) > 0.7:
+        key = df.columns[0]
+        t = df.set_index(key).T.reset_index().rename(columns={"index": "Date"})
+        t.columns = [str(c) for c in t.columns]
+        log.append(f"{where}: dates ran across columns — transposed so each row is one date")
+        return t
+    return df
+
+
+def _signature(df: pd.DataFrame) -> frozenset:
+    return frozenset(_strip_units(c) for c in df.columns)
+
+
+def auto_structure(grids: dict, file_stem: str):
+    """Any workbook/CSV layout → one tidy table. Returns (table | None, log)."""
+    log, frames = [], {}
+    for name, grid in grids.items():
+        where = f"sheet '{name}'" if len(grids) > 1 else "file"
+        t = _find_header(grid, log, where)
+        if t is None or len(t) < 3 or t.shape[1] < 2:
+            if len(grids) > 1:
+                log.append(f"{where}: skipped (empty or not a data table)")
+            continue
+        t = _maybe_transpose(t, log, where)
+        t = _build_date(t, log, where)
+        t = _coerce_types(t)
+        t = _unpivot_wide(t, log, where, measure_name=name if len(grids) > 1 else "Value")
+        dcol = _date_column(t)
+        if dcol is None:
+            log.append(f"{where}: skipped (no date column — looks like notes, a guide or a lookup table)")
+            continue
+        parsed, how = smart_dates(t[dcol])
+        t = t.assign(**{str(dcol): parsed}).rename(columns={dcol: "Date"})
+        t = t[t["Date"].notna()]
+        log.append(f"{where}: dates read as {how}")
+        frames[name] = t
+    if not frames:
+        return None, log + ["No sheet contained a recognisable time-series table."]
+
+    # One sheet per well? (no well column anywhere, several similar sheets) → sheet name becomes the Well
+    no_well = {n: f for n, f in frames.items() if "Well" not in infer_columns(f)[0]}
+    if len(no_well) >= 2 and len(no_well) == len(frames):
+        sigs = {_signature(f) for f in frames.values()}
+        if len(sigs) <= max(1, len(frames) // 2):
+            for n in frames:
+                frames[n] = frames[n].assign(Well=str(n).strip().upper())
+            log.append(f"{len(frames)} sheets share the same layout and have no well column — "
+                       "treated each sheet as one well (sheet name = well ID)")
+    elif len(frames) == 1 and no_well:
+        n = next(iter(frames))
+        wid = (str(n) if len(grids) > 1 and not str(n).lower().startswith("sheet") else file_stem).strip().upper()
+        frames[n] = frames[n].assign(Well=wid)
+        log.append(f"no well column — treated the data as a single well '{wid}'")
+
+    # Normalise the Well column name, then stack same-layout sheets and join different ones on Date + Well
+    for n, f in frames.items():
+        wcol = infer_columns(f)[0].get("Well")
+        if wcol and wcol != "Well" and wcol in f.columns:
+            frames[n] = f.rename(columns={wcol: "Well"})
+        frames[n]["Well"] = frames[n]["Well"].astype(str).str.strip().str.upper()
+    groups = []
+    for n, f in frames.items():
+        for g in groups:
+            a, b = _signature(f), _signature(g[0][1])
+            if len(a & b) / max(len(a | b), 1) >= 0.7:
+                g.append((n, f))
+                break
+        else:
+            groups.append([(n, f)])
+    tables = []
+    for g in groups:
+        if len(g) > 1:
+            log.append(f"stacked {len(g)} sheets with the same layout: {', '.join(str(n) for n, _ in g)}")
+        tables.append(pd.concat([f for _, f in g], ignore_index=True))
+    out = tables[0]
+    for t in tables[1:]:
+        keys = ["Date", "Well"]
+        overlap = [c for c in t.columns if c in out.columns and c not in keys]
+        t = t.drop(columns=overlap)
+        t = t.groupby(keys, as_index=False).mean(numeric_only=True)
+        out = out.merge(t, on=keys, how="outer")
+        log.append(f"joined a second table on Date + Well (added {', '.join(map(str, t.columns.drop(keys)[:6]))})")
+    out = out.sort_values(["Well", "Date"]).reset_index(drop=True)
+    dup = out.duplicated(["Well", "Date"]).mean()
+    if dup > 0.05:
+        log.append(f"⚠ CHECK: {dup:.0%} of rows share the same well and date — the layout may hide a grouping "
+                   "(e.g. several wells in one block). Review the Before/After preview.")
+    log.append(f"result: {len(out):,} rows × {out.shape[1]} columns, {out['Well'].nunique()} well(s)")
+    return out, log
+
+
+def read_grid_csv(data: bytes) -> pd.DataFrame:
+    """CSV as a raw grid: sniff the delimiter, tolerate title lines with fewer fields, keep everything as text."""
+    import csv
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = data.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    sample = text[:50000]
+    try:
+        delim = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+    except csv.Error:
+        delim = ","
+    lines = sample.splitlines()[:2000]
+    width = max((len(r) for r in csv.reader(lines, delimiter=delim)), default=1)
+    return pd.read_csv(io.StringIO(text), sep=delim, header=None, names=range(width), dtype=str,
+                       skip_blank_lines=False, engine="c")
+
+
 def _read_excel(data: bytes) -> dict:
-    """Fastest available Excel engine: calamine (Rust, ~10× faster) → openpyxl."""
+    """Every sheet as a raw grid (no header assumed). Fastest available engine: calamine → openpyxl."""
     last = None
     for engine in ("calamine", "openpyxl"):
         try:
-            return pd.read_excel(io.BytesIO(data), sheet_name=None, engine=engine)
+            return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, engine=engine)
         except (ImportError, ValueError) as exc:
             last = exc
     if isinstance(last, ImportError):
@@ -416,40 +815,85 @@ def _read_excel(data: bytes) -> dict:
     raise ValueError(f"Could not read the workbook ({last}). Try saving it as .xlsx or CSV.") from last
 
 
-def _read_csv(data: bytes) -> pd.DataFrame:
-    """Fastest available CSV parser: pyarrow (multi-threaded) → pandas C engine; falls back on odd encodings."""
-    try:
-        import pyarrow  # noqa: F401
-        return pd.read_csv(io.BytesIO(data), engine="pyarrow")
-    except Exception:  # noqa: BLE001 — any pyarrow problem → robust default parser
-        pass
-    try:
-        return pd.read_csv(io.BytesIO(data), low_memory=False)
-    except UnicodeDecodeError:
-        return pd.read_csv(io.BytesIO(data), encoding="cp1252", low_memory=False)
-
-
 # Heavy results are cached with cache_resource and keyed by a cheap file token (not by hashing the data):
 # no hashing of large DataFrames and no copying of results on every Streamlit rerun.
 @st.cache_resource(show_spinner=False, max_entries=3)
 def read_file(key: str, _data: bytes, name: str) -> dict:
-    """Return {sheet name: frame}. A CSV gives a single 'data' sheet."""
+    """Return {sheet name: raw grid}. A CSV gives a single 'data' sheet. Nothing about the layout is assumed."""
     if not _data:
         raise ValueError("The file is empty.")
     if name.lower().endswith((".xlsx", ".xlsm", ".xls")):
-        sheets = {k: v for k, v in _read_excel(_data).items() if not v.empty}
+        sheets = {str(k): v for k, v in _read_excel(_data).items() if not v.dropna(how="all").empty}
         if not sheets:
             raise ValueError("The workbook has no non-empty sheets.")
         return sheets
-    try:
-        return {"data": _read_csv(_data)}
-    except pd.errors.EmptyDataError as exc:
-        raise ValueError("No readable columns found in the CSV.") from exc
+    grid = read_grid_csv(_data)
+    if grid.dropna(how="all").empty:
+        raise ValueError("No readable data found in the CSV.")
+    return {"data": grid}
+
+
+STRUCTURE_GUIDE = """You restructure messy oil & gas production spreadsheets into ONE tidy table.
+Variable `sheets` is a dict {sheet name: raw grid DataFrame read with header=None (all cells as found)}.
+Write Python (pd, np available; no imports) that sets `result` to a DataFrame with ONE ROW PER WELL PER DATE:
+a 'Date' column (datetime), a 'Well' column (string ID), and one numeric column per measurement, keeping the
+original measurement names (add units in brackets if you can see them, e.g. 'Oil (bbl/d)').
+Handle titles, units rows, merged/multi-level headers, one-sheet-per-well, wide layouts, transposed tables,
+totals rows and notes sheets. If there is no well identifier, use the sheet name or 'WELL-1'.
+Reply with ONE ```python code block only."""
+
+
+def llm_structure(grids: dict):
+    """Ask Claude to write the reshaping when the built-in rules cannot make sense of the layout."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=_api_key())
+    preview = "\n\n".join(f"SHEET {n!r} shape={g.shape}\n{g.head(25).to_csv(index=False, header=False)}"
+                            for n, g in list(grids.items())[:8])
+    messages = [{"role": "user", "content": preview[:60000]}]
+    for _ in range(2):
+        msg = client.messages.create(model=LLM_MODEL, max_tokens=2500, system=STRUCTURE_GUIDE, messages=messages)
+        text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+        code = _extract_code(text)
+        try:
+            ns = run_safely(code, {"sheets": {k: v.copy() for k, v in grids.items()}, "pd": pd, "np": np})
+            res = ns.get("result")
+            if isinstance(res, pd.DataFrame) and len(res) >= 3:
+                return _coerce_types(res.reset_index(drop=True)), code
+            raise ValueError("result was not a table")
+        except Exception as exc:  # noqa: BLE001
+            messages += [{"role": "assistant", "content": text},
+                         {"role": "user", "content": f"That failed: {type(exc).__name__}: {exc}. Return corrected code only."}]
+    return None, None
 
 
 @st.cache_resource(show_spinner=False, max_entries=3)
-def clean_cached(key: str, _sheets: dict, sheet: str, units: tuple, mapping: tuple):
-    return clean_data(_sheets[sheet], dict(units), dict(mapping))
+def structure_cached(key: str, _grids: dict, stem: str, use_llm: bool):
+    """Built-in rules first; if the result still lacks Date / Well / oil, let Claude restructure (when available)."""
+    tidy, log = auto_structure(_grids, stem)
+    found = set(infer_columns(tidy)[0]) if tidy is not None else set()
+    ok = tidy is not None and {"Date", "Well"} <= found and bool({"Oil_Rate", "Liquid_Rate"} & found) \
+        and not any(x.startswith("⚠") for x in log)
+    code = None
+    if not ok and use_llm:
+        try:
+            alt, code = llm_structure(_grids)
+            if alt is not None:
+                tidy = alt
+                log = [x for x in log if not x.startswith("⚠")] + \
+                      ["Built-in rules were not sure about this layout — Claude restructured it (see code below)."]
+                m = infer_columns(tidy)[0]
+                if {"Date", "Well"} <= set(m):
+                    d = tidy[m["Well"]].astype(str) + "|" + pd.to_datetime(tidy[m["Date"]], errors="coerce").astype(str)
+                    if d.duplicated().mean() > 0.05:
+                        log.append("⚠ CHECK: Claude's table still has repeated well/date rows — please review.")
+        except Exception as exc:  # noqa: BLE001
+            log = log + [f"AI restructuring unavailable ({type(exc).__name__})."]
+    return tidy, log, code
+
+
+@st.cache_resource(show_spinner=False, max_entries=3)
+def clean_cached(key: str, _tidy: pd.DataFrame, units: tuple, mapping: tuple):
+    return clean_data(_tidy, dict(units), dict(mapping))
 
 
 def template_frame() -> pd.DataFrame:
@@ -1649,6 +2093,21 @@ def page_quality(f: Field):
              ("Duplicates merged", f"{r['duplicates']:,}", "exact + same well/date"),
              ("Invalid values", f"{r['invalid']:,}", "negative rates / pressures"),
              ("Outliers capped", f"{r['capped']:,}", "per-well 3×IQR")])
+    card_header("Automatic restructuring", f"{r.get('n_sheets', 1)} sheet(s) read · every step FIELDWISE took "
+                "to turn your layout into one row per well per date")
+    note("<br>".join("• " + esc(x) for x in r.get("structure_log", [])) or "The file was already in tidy form.")
+    a, b = st.columns(2, gap="large")
+    with a:
+        card_header("Before", "first rows of your file, exactly as uploaded")
+        if r.get("grid_preview") is not None:
+            table(r["grid_preview"], 2, height=300)
+    with b:
+        card_header("After", "the tidy table FIELDWISE works from")
+        if r.get("tidy_preview") is not None:
+            table(r["tidy_preview"], 2, height=300)
+    if r.get("structure_code"):
+        with st.expander("Restructuring code written by Claude"):
+            st.code(r["structure_code"], language="python")
     a, b = st.columns(2, gap="large")
     with a:
         card_header("Column mapping", "your header → FIELDWISE field")
@@ -1794,13 +2253,18 @@ def sidebar_upload():
     data = up.getvalue()
     token = _file_token(up, data)
     try:
-        sheets = read_file(token, data, up.name)
+        grids = read_file(token, data, up.name)
     except Exception as exc:  # noqa: BLE001
         return None, f"Could not read {up.name}: {exc}"
-    sheet = list(sheets)[0]
-    if len(sheets) > 1:
-        sheet = st.sidebar.selectbox("Sheet", list(sheets))
-    raw = sheets[sheet]
+    stem = os.path.splitext(up.name)[0]
+    try:
+        raw, s_log, s_code = structure_cached(token, grids, stem, llm_available())
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Could not understand the layout of {up.name}: {exc}"
+    if raw is None:
+        return None, ("Could not find a time-series table in this file. " + " ".join(s_log[-2:]) +
+                      " Add an Anthropic API key under AI assistant to let Claude restructure unusual layouts.")
+    sheet = "auto"
     auto, how = infer_cached(f"{token}|{sheet}", raw)
 
     # --- Column mapping: automatic guess, every field correctable by the user
@@ -1832,7 +2296,7 @@ def sidebar_upload():
             units[col] = st.selectbox(col.replace("_", " "), keys, index=keys.index(guess), key=f"u_{token}_{sheet}_{col}")
     map_key = tuple(sorted(mapping.items()))
     try:
-        df, rep = clean_cached(f"{token}|{sheet}", sheets, sheet, tuple(sorted(units.items())), map_key)
+        df, rep = clean_cached(f"{token}|{sheet}", raw, tuple(sorted(units.items())), map_key)
     except Exception as exc:  # noqa: BLE001
         return None, f"Could not process {up.name}: {exc}"
     if df is None:
@@ -1841,7 +2305,10 @@ def sidebar_upload():
             return None, (f"Could not find: {need}. Open **Column mapping** in the sidebar and pick the matching "
                           f"columns from your file (oil can also be derived from liquid rate + water cut).")
         return None, rep.get("error", "The data could not be cleaned.")
-    rep = {**rep, "auto_units": auto_units,
+    first = next(iter(grids.values()))
+    rep = {**rep, "auto_units": auto_units, "structure_log": s_log, "structure_code": s_code,
+           "n_sheets": len(grids), "grid_preview": first.head(12).dropna(how="all", axis=1).astype(str).replace("nan", ""),
+           "tidy_preview": raw.head(12),
            "how": {f: ("set manually" if f in manual else how.get(f, "")) for f in rep["mapped"]}}
     key = f"{token}|{sheet}|{sorted(units.items())}|{map_key}"
     return Field(df=df, name=up.name, report=rep, lift_is_gas=units.get("Injection_Rate", "Sm³/d") in _GAS,
@@ -1890,6 +2357,10 @@ def main():
 
     settings = sidebar_settings()
     sidebar_ai()
+    if any(str(x).startswith("⚠") for x in field.report.get("structure_log", [])):
+        st.warning("FIELDWISE is not fully sure how this file is organised — see **Data & Quality → Automatic "
+                   "restructuring** and check the Before/After preview. Adding an Anthropic API key lets Claude "
+                   "restructure unusual layouts automatically.")
     field.report = {**field.report, "interval": settings.test_interval, "co2": settings.co2, "oil_price": settings.oil_price}
     page = st.sidebar.radio("Navigate", list(PAGES), format_func=lambda p: f"{PAGES[p]}  {p}")
     st.sidebar.markdown(footer, unsafe_allow_html=True)
