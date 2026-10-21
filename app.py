@@ -851,7 +851,7 @@ def llm_structure(grids: dict):
                             for n, g in list(grids.items())[:8])
     messages = [{"role": "user", "content": preview[:60000]}]
     for _ in range(2):
-        msg = client.messages.create(model=LLM_MODEL, max_tokens=2500, system=STRUCTURE_GUIDE, messages=messages)
+        msg, _ = _call_claude(client, messages, STRUCTURE_GUIDE, 4000)
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         code = _extract_code(text)
         try:
@@ -1261,54 +1261,90 @@ def rank_cached(key: str, _df, _dca, _eq, _s: Settings, settings_key: tuple):
 
 
 # ---- 3f. Ask FIELDWISE — answer free-form questions about the uploaded sheet ---------
-LLM_MODEL = "claude-sonnet-5-5"   # change to "claude-opus-5-5" for harder questions, "claude-haiku-5-5" for speed
+LLM_MODELS = {  # API model IDs (platform.claude.com/docs/en/models/overview)
+    "claude-sonnet-5-5": "Sonnet 5.5 — balanced (recommended)",
+    "claude-opus-5-5": "Opus 5.5 — most capable, slower",
+    "claude-haiku-5-5": "Haiku 5.5 — fastest, cheapest",
+}
+LLM_MODEL = "claude-sonnet-5-5"
 
-DOMAIN_GUIDE = """You are FIELDWISE, a senior petroleum production engineer and data analyst.
+
+def llm_model() -> str:
+    return st.session_state.get("llm_model") or LLM_MODEL
+
+
+DOMAIN_GUIDE = """You are FIELDWISE, a senior petroleum production engineer and data analyst inside a dashboard.
 Answer the user's question by writing Python that computes the answer from the data. Use your own engineering
 knowledge to decide which columns are needed, even when their names are unusual: read the column names AND the
-sample values/ranges to infer meaning and units, and state any assumption you make.
+sample values/ranges to infer meaning and units, and state any assumption you make in the answer.
+If the question is conceptual (no data needed), just set `answer` to a concise expert explanation.
 
-Available variables (already loaded — never import anything):
-- raw: pandas DataFrame — the sheet exactly as uploaded (original column names, may be messy; parse with
-  pd.to_numeric(..., errors="coerce") / pd.to_datetime(..., errors="coerce") as needed).
+Variables already loaded (you may also import pandas, numpy, math, statistics, datetime, re, collections,
+itertools, scipy, plotly.express or plotly.graph_objects — nothing else):
+- raw: pandas DataFrame — the uploaded data as one tidy table with the ORIGINAL column names (may be messy;
+  parse with pd.to_numeric(..., errors="coerce") / pd.to_datetime(..., errors="coerce") if needed).
 - df: cleaned, standardised DataFrame. Columns & units: Date (datetime), Well (str), Oil_Rate, Water_Rate (m³/d),
   Gas_Rate (Sm³/d), Wellhead_Pressure, Bottomhole_Pressure (bar), Injection_Rate (lift gas, Sm³/d or m³/d),
   plus optional Choke_Size (1/64 in), Pump_Vibration (mm/s), Motor_Temperature (°C), Motor_Current (A),
   Pump_Frequency (Hz), Energy_kWh (kWh). Prefer df for anything these columns cover; use raw for anything else.
-- ranked: one row per well with latest 7-day Oil_Rate, Water_Cut (%), Priority, Why, Status (equipment), Decline (%/yr).
-- decline: per-well Arps decline table.   - pd, np, px (plotly.express), go (plotly.graph_objects).
+- ranked: one row per well (latest 7-day averages) with Oil_Rate, Water_Rate, Water_Cut (%), Priority, Why,
+  Status (equipment), Decline (%/yr).
+- decline: per-well Arps decline table.     - pd, np, px, go already imported.
 
 Useful knowledge: water cut = qw/(qo+qw); GOR = qg/qo; WOR = qw/qo; liquid = qo+qw; cumulative volume =
 Σ(rate × days between samples); 1 m³ = 6.2898 bbl; 1 Sm³ = 35.3147 scf; 1 bar = 14.5038 psi;
 productivity index J = q/(Pr − Pwf); drawdown = Pr − Pwf; specific energy = kWh / bbl oil.
 
 Output rules: reply with ONE ```python code block only. The code must set:
-  answer  — a short markdown string with the actual computed numbers (use f-strings, sensible rounding, units)
-  result  — a DataFrame/Series/number to display (or None)
+  answer  — a short markdown string with the actual computed numbers (f-strings, sensible rounding, units)
+  result  — a DataFrame/Series/number to show as a table (or None)
   fig     — optional plotly figure (or None)
-No file, network or system access. Keep it efficient."""
+Do not read or write files, use the network, or call to_csv/to_markdown/to_html. Keep it efficient."""
+
+_SAFE_MODULES = {"pandas", "numpy", "math", "statistics", "datetime", "re", "collections", "itertools", "functools",
+                 "scipy", "scipy.stats", "scipy.optimize", "scipy.signal", "scipy.interpolate",
+                 "plotly", "plotly.express", "plotly.graph_objects"}
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
+    if level == 0 and name in _SAFE_MODULES:
+        return builtins.__import__(name, globals, locals, fromlist, level)
+    raise ImportError(f"module '{name}' is not available in FIELDWISE analyses")
+
 
 _SAFE_BUILTINS = {n: getattr(builtins, n) for n in (
-    "abs all any bool dict enumerate filter float format int isinstance len list map max min next print range "
-    "reversed round set slice sorted str sum tuple zip ValueError KeyError TypeError Exception True False None").split()}
+    "abs all any bool callable chr complex dict divmod enumerate filter float format frozenset hasattr hash int "
+    "isinstance issubclass iter len list map max min next object ord pow range repr reversed round set slice "
+    "sorted str sum tuple type zip ArithmeticError AttributeError Exception IndexError KeyError LookupError "
+    "NotImplementedError RuntimeError StopIteration TypeError ValueError ZeroDivisionError True False None").split()}
+_SAFE_BUILTINS.update({"__import__": _safe_import, "__build_class__": builtins.__build_class__})
 _BLOCKED_NAMES = {"open", "exec", "eval", "compile", "input", "globals", "locals", "vars", "getattr", "setattr",
                   "delattr", "breakpoint", "help", "__import__", "memoryview", "os", "sys", "subprocess"}
 _BLOCKED_ATTR = re.compile(r"^(_|to_(csv|excel|pickle|parquet|sql|json|html|feather|hdf|clipboard|latex|markdown|xml|stata|orc)$|"
-                           r"read_|eval$|system$|popen$|write)")
+                           r"read_|write|eval$|system$|popen$|save|load$|loadtxt$|fromfile$|tofile$|genfromtxt$|"
+                           r"memmap$|DataSource$|ctypeslib$|io$|os$|sys$|subprocess$|import_module$|builtins$)")
 
 
 def run_safely(code: str, env: dict) -> dict:
-    """Execute model-written analysis code with no imports, no private attributes and no file/network access."""
+    """Execute model-written analysis code: whitelisted imports only, no private attributes, no file/network access."""
     tree = ast.parse(code)
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
-            raise PermissionError("imports are not allowed")
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            raise PermissionError("global/nonlocal are not allowed")
+        if isinstance(node, ast.Import) and any(a.name not in _SAFE_MODULES for a in node.names):
+            raise PermissionError("only pandas/numpy/math/statistics/datetime/re/scipy/plotly imports are allowed")
+        if isinstance(node, ast.ImportFrom) and (node.level or node.module not in _SAFE_MODULES):
+            raise PermissionError(f"import from '{node.module}' is not allowed")
         if isinstance(node, ast.Attribute) and _BLOCKED_ATTR.match(node.attr):
             raise PermissionError(f"'{node.attr}' is not allowed")
         if isinstance(node, ast.Name) and (node.id in _BLOCKED_NAMES or node.id.startswith("__")):
             raise PermissionError(f"'{node.id}' is not allowed")
-    ns = {"__builtins__": _SAFE_BUILTINS, **env, "answer": None, "result": None, "fig": None}
-    exec(compile(tree, "<fieldwise-analysis>", "exec"), ns)   # noqa: S102 — sandboxed above
+    printed = []
+    ns = {"__builtins__": {**_SAFE_BUILTINS, "print": lambda *a, **k: printed.append(" ".join(map(str, a)))},
+          "__name__": "fieldwise_analysis", **env, "answer": None, "result": None, "fig": None}
+    exec(compile(tree, "<fieldwise-analysis>", "exec"), ns)   # noqa: S102 — checked above
+    if not ns.get("answer") and printed:
+        ns["answer"] = "\n\n".join(printed[-20:])
     return ns
 
 
@@ -1318,32 +1354,103 @@ def describe_sheet(raw: pd.DataFrame, max_cols: int = 80) -> str:
     for col in list(raw.columns)[:max_cols]:
         v = raw[col]
         nn = v.notna().mean() * 100
-        num = pd.to_numeric(v, errors="coerce")
-        if num.notna().mean() > 0.8:
-            info = f"numeric min={num.min():.4g} median={num.median():.4g} max={num.max():.4g}"
+        if pd.api.types.is_datetime64_any_dtype(v):
+            info = f"dates {v.min():%Y-%m-%d} → {v.max():%Y-%m-%d}"
         else:
-            info = f"text, {v.nunique()} unique, e.g. {', '.join(map(str, v.dropna().astype(str).unique()[:4]))}"
+            num = pd.to_numeric(v, errors="coerce")
+            if num.notna().mean() > 0.8:
+                info = f"numeric min={num.min():.4g} median={num.median():.4g} max={num.max():.4g}"
+            else:
+                info = f"text, {v.nunique()} unique, e.g. {', '.join(map(str, v.dropna().astype(str).unique()[:4]))}"
         lines.append(f"- {str(col)!r}: {info}; {nn:.0f}% filled")
     return "\n".join(lines)
 
 
 def _api_key() -> str | None:
-    key = st.session_state.get("anthropic_key")
+    key = (st.session_state.get("anthropic_key") or "").strip()
     if key:
         return key
     try:
         key = st.secrets.get("ANTHROPIC_API_KEY")
     except Exception:  # noqa: BLE001 — no secrets file
         key = None
-    return key or os.environ.get("ANTHROPIC_API_KEY")
+    return (key or os.environ.get("ANTHROPIC_API_KEY") or "").strip() or None
+
+
+def _key_source() -> str:
+    if (st.session_state.get("anthropic_key") or "").strip():
+        return "pasted on this page"
+    try:
+        if st.secrets.get("ANTHROPIC_API_KEY"):
+            return "Streamlit Secrets"
+    except Exception:  # noqa: BLE001
+        pass
+    return "environment variable" if os.environ.get("ANTHROPIC_API_KEY") else ""
+
+
+def sdk_installed() -> bool:
+    try:
+        import anthropic  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def llm_available() -> bool:
-    try:
-        import anthropic  # noqa: F401
-    except ImportError:
-        return False
-    return bool(_api_key())
+    return sdk_installed() and bool(_api_key())
+
+
+def explain_api_error(exc: Exception, model: str = "") -> str:
+    """Turn an Anthropic API exception into a plain instruction."""
+    status = getattr(exc, "status_code", None)
+    msg = str(getattr(exc, "message", "") or exc)
+    low, name = msg.lower(), type(exc).__name__
+    if status == 402 or "credit balance" in low or "billing" in low:
+        return ("Your Anthropic account has no API credit. Add credit at console.anthropic.com → Billing "
+                "(API usage is billed separately from a Claude.ai subscription).")
+    if status == 401 or "authentication" in name.lower() or "x-api-key" in low:
+        return "The API key was rejected. Copy it again from console.anthropic.com → API keys (it starts with sk-ant-)."
+    if status == 403:
+        return "This API key doesn't have permission for that request — check its workspace in the Anthropic Console."
+    if status == 404 or "not_found" in low:
+        return f"Model '{model}' isn't available to this key — pick another model below."
+    if status == 429:
+        return "Rate or spend limit reached for this key. Wait a minute, or raise the limit in the Anthropic Console."
+    if status in (500, 529) or "overloaded" in low:
+        return "Claude is busy right now. Try again in a moment."
+    if "connection" in name.lower() or "timeout" in name.lower():
+        return "This server can't reach api.anthropic.com (no internet access from where the app is running)."
+    return f"{name}: {msg[:220]}"
+
+
+def check_connection(force: bool = False) -> tuple:
+    """One tiny request to confirm the key, credit and model work. Cached per key + model."""
+    if not sdk_installed():
+        return False, "The 'anthropic' package isn't installed on this server — add `anthropic` to requirements.txt and reboot."
+    key, model = _api_key(), llm_model()
+    if not key:
+        return False, "No API key yet."
+    tag = hashlib.md5(f"{key}|{model}".encode()).hexdigest()
+    cache = st.session_state.setdefault("_conn", {})
+    if tag in cache and not force:
+        return cache[tag]
+    import anthropic
+    client = anthropic.Anthropic(api_key=key)
+    result = None
+    for m in [model] + [x for x in LLM_MODELS if x != model]:      # chosen model first, others if it isn't available
+        try:
+            client.messages.create(model=m, max_tokens=5, messages=[{"role": "user", "content": "Reply with OK."}])
+            note_ = "" if m == model else f" ({LLM_MODELS.get(model, model).split(' —')[0]} isn't available to this key)"
+            st.session_state["llm_model"] = m
+            result = (True, f"Connected to Claude · {m}{note_}")
+            break
+        except Exception as exc:  # noqa: BLE001
+            result = (False, explain_api_error(exc, m))
+            if getattr(exc, "status_code", None) != 404:
+                break
+    cache[tag] = result
+    cache[hashlib.md5(f"{key}|{llm_model()}".encode()).hexdigest()] = result
+    return result
 
 
 def _extract_code(text: str) -> str:
@@ -1351,27 +1458,54 @@ def _extract_code(text: str) -> str:
     return (m.group(1) if m else text).strip()
 
 
+def _call_claude(client, messages, system: str, max_tokens: int):
+    """Call the chosen model; if it isn't available to this key, try the other models once."""
+    model = llm_model()
+    order = [model] + [m for m in LLM_MODELS if m != model]
+    last = None
+    for m in order:
+        try:
+            return client.messages.create(model=m, max_tokens=max_tokens, system=system, messages=messages), m
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if getattr(exc, "status_code", None) != 404:
+                raise
+    raise last
+
+
 def ask_llm(question: str, f: "Field", env: dict) -> dict:
-    """Claude writes the analysis, FIELDWISE runs it on the real data; one automatic self-correction on error."""
+    """Claude writes the analysis, FIELDWISE runs it on the real data; up to two automatic self-corrections."""
     import anthropic
-    client = anthropic.Anthropic(api_key=_api_key())
-    context = (f"{describe_sheet(f.raw)}\n\ndf: {len(f.df):,} rows, {f.df['Well'].nunique()} wells, "
-               f"{f.df['Date'].min():%Y-%m-%d} → {f.df['Date'].max():%Y-%m-%d}. Column mapping used: {f.report.get('mapped')}.")
+    client = anthropic.Anthropic(api_key=_api_key(), max_retries=2)
+    ranked, dca = env.get("ranked"), env.get("decline")
+    context = (f"{describe_sheet(f.raw)}\n\ndf: {len(f.df):,} rows, {f.df['Well'].nunique()} wells "
+               f"({', '.join(map(str, sorted(f.df['Well'].unique())[:15]))}), "
+               f"{f.df['Date'].min():%Y-%m-%d} → {f.df['Date'].max():%Y-%m-%d}; columns: {', '.join(map(str, f.df.columns))}.\n"
+               f"ranked columns: {', '.join(map(str, ranked.columns)) if ranked is not None else '—'}.\n"
+               f"decline columns: {', '.join(map(str, dca.columns)) if dca is not None and len(dca) else '—'}.\n"
+               f"Column mapping used (field ← original header): {f.report.get('mapped')}.")
     messages = [{"role": "user", "content": f"DATA\n{context}\n\nQUESTION\n{question}"}]
-    last_err = None
-    for _ in range(2):
-        msg = client.messages.create(model=LLM_MODEL, max_tokens=2000, system=DOMAIN_GUIDE, messages=messages)
+    last_err, used = None, llm_model()
+    for _ in range(3):
+        msg, used = _call_claude(client, messages, DOMAIN_GUIDE, 4000)
         text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
         code = _extract_code(text)
         try:
             ns = run_safely(code, {k: (v.copy() if isinstance(v, pd.DataFrame) else v) for k, v in env.items()})
-            return {"engine": f"Claude · {LLM_MODEL}", "answer": ns.get("answer") or "Done.", "result": ns.get("result"),
-                    "fig": ns.get("fig"), "code": code}
-        except Exception as exc:  # noqa: BLE001 — send the error back once so the model can fix its code
+            res = ns.get("result")
+            if isinstance(res, (list, dict)) and res:
+                try:
+                    res = pd.DataFrame(res)
+                except ValueError:
+                    res = pd.Series(res)
+            ans = ns.get("answer") or ("Here is the result." if res is not None or ns.get("fig") is not None else "Done.")
+            return {"engine": f"Claude · {used}", "answer": str(ans), "result": res, "fig": ns.get("fig"), "code": code}
+        except Exception as exc:  # noqa: BLE001 — send the error back so the model can fix its code
             last_err = f"{type(exc).__name__}: {exc}"
             messages += [{"role": "assistant", "content": text},
-                         {"role": "user", "content": f"That code failed with {last_err}. Return corrected code only."}]
-    raise RuntimeError(f"The generated analysis failed twice ({last_err}).")
+                         {"role": "user", "content": f"Running that code raised {last_err}. "
+                                                     "Fix it and return the full corrected code block only."}]
+    raise RuntimeError(f"Claude's analysis code failed 3 times (last error: {last_err}).")
 
 
 # Offline engine: understands common production questions without any API, and can use ANY numeric column
@@ -2111,7 +2245,8 @@ def page_quality(f: Field):
     a, b = st.columns(2, gap="large")
     with a:
         card_header("Column mapping", "your header → FIELDWISE field")
-        table(pd.DataFrame([{"FIELDWISE field": k, "Your column": v, "How recognised": r.get("how", {}).get(k, "")}
+        table(pd.DataFrame([{"Field": FIELD_LABELS.get(k, k), "Your column": v,
+                             "How recognised": HOW_TEXT.get(r.get("how", {}).get(k, ""), r.get("how", {}).get(k, ""))}
                             for k, v in r["mapped"].items()]), height=430)
     with b:
         card_header("Cleaning log")
@@ -2166,16 +2301,59 @@ def _render_result(item: dict):
             st.code(item["code"], language="python")
 
 
+def _save_key():
+    st.session_state["anthropic_key"] = (st.session_state.get("anthropic_key_input") or "").strip()
+
+
+def _save_model():
+    st.session_state["llm_model"] = st.session_state.get("llm_model_input") or LLM_MODEL
+
+
+def ai_connection_panel() -> tuple:
+    """Shows whether Claude is connected and, if not, exactly why and how to fix it. Returns (connected, reason)."""
+    ok, why = check_connection() if llm_available() else (False, "")
+    models = list(LLM_MODELS)
+    if ok:
+        note(f"✅ <b>{esc(why)}</b> — answers are written by Claude and calculated on your actual data "
+             f"(key from {esc(_key_source())}).")
+    elif not sdk_installed():
+        note("<b>Claude isn't available on this server</b> — the <code>anthropic</code> package is missing. Add "
+             "<code>anthropic</code> to requirements.txt and reboot the app. Meanwhile the offline engine answers.", warn=True)
+    elif _api_key():
+        note(f"<b>Claude couldn't be reached, so the offline engine is answering.</b><br>{esc(why)}", warn=True)
+    else:
+        note("<b>Claude isn't connected yet, so the offline engine is answering</b> (totals, averages, highs/lows, "
+             "trends, declines, water cut, GOR, WOR per well or field). Paste an Anthropic API key below to let "
+             "Claude answer any question about any column.", warn=True)
+    with st.expander("Claude connection" + (" · connected" if ok else " · set up"), expanded=not ok):
+        c1, c2, c3 = st.columns([2.2, 1.6, 0.9])
+        with c1:
+            st.text_input("Anthropic API key", type="password", key="anthropic_key_input", on_change=_save_key,
+                          value=st.session_state.get("anthropic_key", ""), placeholder="sk-ant-…",
+                          help="Kept only in this browser session. To avoid pasting it each time on Streamlit Cloud: "
+                               "Manage app → Settings → Secrets → ANTHROPIC_API_KEY = \"sk-ant-…\"")
+        with c2:
+            cur = llm_model()
+            st.selectbox("Model", models, index=models.index(cur) if cur in models else 0,
+                         format_func=lambda m: LLM_MODELS[m], key="llm_model_input", on_change=_save_model)
+        with c3:
+            st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
+            if st.button("Test", **W):
+                _save_key()
+                _save_model()
+                ok, why = check_connection(force=True)
+                (st.success if ok else st.error)(why)
+        st.caption("Get a key at console.anthropic.com → API keys, and add a little credit under Billing — "
+                   "each question costs a fraction of a cent.")
+    return ok, why
+
+
 @_fragment
 def page_ask(f: Field, ranked, dca):
-    smart = llm_available()
-    page_header("Ask FIELDWISE", "Ask anything about your sheet in plain English — including columns the dashboard "
+    page_header("Ask FIELDWISE", "Ask anything about your data in plain English — including columns the dashboard "
                 "does not use. FIELDWISE works out which data it needs, calculates on the real numbers and shows how.",
-                f"Claude · {LLM_MODEL}" if smart else "Offline engine")
-    if not smart:
-        note("Running the <b>offline engine</b>: it handles totals, averages, highs/lows, trends, declines and ratios "
-             "(water cut, GOR, WOR) per well or field, and can use <i>any</i> numeric column by name. "
-             "For open-ended questions, add an Anthropic API key under <b>AI assistant</b> in the sidebar.")
+                f"Claude · {llm_model()}" if llm_available() else "Offline engine")
+    smart, why_not = ai_connection_panel()
     st.caption("Try one:")
     cols = st.columns(3)
     for i, ex in enumerate(EXAMPLE_QUESTIONS):
@@ -2185,19 +2363,22 @@ def page_ask(f: Field, ranked, dca):
     q = st.text_input("Your question", key="ask_q", placeholder="e.g. Which well had the biggest drop in oil last month?")
     if st.button("Ask", type="primary") and q.strip():
         env = {"raw": f.raw, "df": f.df, "ranked": ranked, "decline": dca, "pd": pd, "np": np, "px": px, "go": go}
-        with st.spinner("Thinking about your data…"):
-            out = None
+        with st.spinner("Claude is working out the answer…" if smart else "Calculating…"):
+            out, reason = None, (why_not if (not smart and _api_key()) else None)
             if smart:
                 try:
                     out = ask_llm(q, f, env)
-                except Exception as exc:  # noqa: BLE001 — fall back to the offline engine
-                    st.warning(f"AI assistant unavailable ({type(exc).__name__}); answered with the offline engine.")
+                except Exception as exc:  # noqa: BLE001 — fall back to the offline engine, but say exactly why
+                    reason = explain_api_error(exc, llm_model()) if hasattr(exc, "status_code") or \
+                        "anthropic" in type(exc).__module__ else str(exc)
             if out is None:
                 try:
                     out = ask_offline(q, f)
                 except Exception as exc:  # noqa: BLE001
                     out = {"engine": "Offline engine", "answer": f"Sorry — I could not compute that ({exc}).",
                            "result": None, "fig": None}
+                if reason:
+                    out["engine"] = f"Offline engine — Claude unavailable: {reason}"
         st.session_state.setdefault("ask_history", []).insert(0, {"q": q, **out})
     for item in st.session_state.get("ask_history", [])[:6]:
         _render_result(item)
@@ -2242,7 +2423,109 @@ def infer_cached(key: str, _raw: pd.DataFrame):
     return infer_columns(_raw)
 
 
-NOT_IN_FILE = "— not in file —"
+FIELD_LABELS = {
+    "Date": "Date", "Well": "Well name / ID", "Oil_Rate": "Oil rate", "Water_Rate": "Water rate",
+    "Gas_Rate": "Gas rate", "Wellhead_Pressure": "Wellhead pressure", "Bottomhole_Pressure": "Bottom-hole pressure",
+    "Injection_Rate": "Lift-gas rate", "Choke_Size": "Choke size", "Pump_Vibration": "Pump vibration",
+    "Motor_Temperature": "Motor temperature", "Motor_Current": "Motor current", "Pump_Frequency": "Pump frequency",
+    "Energy_kWh": "Energy use", "Water_Cut": "Water cut", "Liquid_Rate": "Gross liquid rate", "GOR": "Gas-oil ratio",
+}
+FIELD_GROUPS = [
+    ("Essential", ["Date", "Well", "Oil_Rate"]),
+    ("Production", ["Water_Rate", "Gas_Rate", "Wellhead_Pressure", "Bottomhole_Pressure", "Injection_Rate", "Choke_Size"]),
+    ("Pump / equipment", SENSOR_COLUMNS),
+    ("Helpers — used to calculate missing rates", AUX_COLUMNS),
+]
+HOW_TEXT = {"known name": "name match", "keyword in header": "name contains a keyword"}
+NOT_IN_FILE = "—  not in this file  —"
+
+
+@st.cache_resource(show_spinner=False, max_entries=6)
+def column_profile(key: str, _raw: pd.DataFrame):
+    """For every column: its kind (date / number / text) and an example value — used to filter the dropdowns."""
+    kinds, examples = {}, {}
+    sample = _raw.head(300)
+    for c in _raw.columns:
+        v = sample[c].dropna()
+        ex = str(v.iloc[0]) if len(v) else ""
+        if pd.api.types.is_datetime64_any_dtype(v):
+            kinds[c], ex = "date", (f"{v.iloc[0]:%d %b %Y}" if len(v) else "")
+        elif len(v) and pd.to_numeric(v, errors="coerce").notna().mean() > 0.8:
+            kinds[c] = "number"
+            num = pd.to_numeric(v, errors="coerce").dropna()
+            ex = f"{num.iloc[0]:,.4g}" if len(num) else ex
+        elif len(v) and v.astype(str).head(50).map(_is_dateish).mean() > 0.8:
+            kinds[c] = "date"
+        else:
+            kinds[c] = "text"
+        examples[str(c)] = ex[:16]
+    return {str(k): v for k, v in kinds.items()}, examples
+
+
+def _field_options(field: str, kinds: dict, current) -> list:
+    want = "date" if field == "Date" else "text" if field == "Well" else "number"
+    cols = [c for c, k in kinds.items() if k == want] or list(kinds)
+    if current and current not in cols:
+        cols = [current] + cols
+    return [NOT_IN_FILE] + cols
+
+
+def sidebar_columns(token: str, raw: pd.DataFrame, auto: dict, how: dict):
+    """Plain-language summary of what each column was recognised as; an optional editor to fix a wrong guess.
+    Returns (mapping {field: column | None}, set of fields changed by the user)."""
+    store = st.session_state.setdefault(f"ovr_{token}", {})        # user corrections survive page changes
+    mapping = {f: store.get(f, auto.get(f)) for f in ALL_FIELDS}
+    found = [f for f in ALL_FIELDS if mapping.get(f)]
+    missing = [f for f in ("Date", "Well") if not mapping.get(f)]
+    if not mapping.get("Oil_Rate") and not mapping.get("Liquid_Rate"):
+        missing.append("Oil_Rate")
+    label = f"Columns · {len(found)} recognised" + (" · needs attention" if missing else "")
+    with st.sidebar.expander(label, expanded=bool(missing)):
+        if missing:
+            st.warning("Couldn't find: " + ", ".join(FIELD_LABELS[m] for m in missing) +
+                       ". Turn on **Fix a column** and pick it from your file.")
+        else:
+            st.caption("FIELDWISE read your headers and values and recognised these. Nothing to do unless one is wrong.")
+        rows = "".join(
+            f'<div style="padding:5px 0;border-bottom:1px solid #1E2A3A;line-height:1.35">'
+            f'<span style="color:#E2E8F0;font-weight:600">{esc(FIELD_LABELS[f])}</span>'
+            f'<span style="color:#64748B"> ← </span><span style="color:#2DD4BF">{esc(mapping[f])}</span>'
+            f'<div style="color:#64748B;font-size:11px">'
+            f'{"changed by you" if f in store else esc(HOW_TEXT.get(how.get(f, ""), how.get(f, "")))}</div></div>'
+            for f in found)
+        st.markdown(f'<div style="font-size:13px">{rows}</div>', unsafe_allow_html=True)
+        not_found = [FIELD_LABELS[f] for f in ALL_FIELDS if not mapping.get(f) and f not in AUX_COLUMNS]
+        if not_found:
+            st.caption("Not in this file (the app adapts): " + ", ".join(not_found))
+
+        if st.toggle("Fix a column", value=bool(missing), key=f"edit_{token}"):
+            kinds, examples = column_profile(token, raw)
+            fmt_opt = lambda c: c if c == NOT_IN_FILE else (f"{c}   ·  e.g. {examples[c]}" if examples.get(c) else c)  # noqa: E731
+            for title, fields in FIELD_GROUPS:
+                st.markdown(f'<div style="color:#94A3B8;font-size:11px;font-weight:700;letter-spacing:.06em;'
+                            f'text-transform:uppercase;margin:10px 0 2px">{esc(title)}</div>', unsafe_allow_html=True)
+                for f in fields:
+                    opts = _field_options(f, kinds, mapping.get(f))
+                    cur = mapping.get(f)
+                    sel = st.selectbox(FIELD_LABELS[f] + (" *" if f in REQUIRED else ""), opts,
+                                       index=opts.index(cur) if cur in opts else 0, format_func=fmt_opt,
+                                       key=f"m_{token}_{f}")
+                    val = None if sel == NOT_IN_FILE else sel
+                    if val != auto.get(f):
+                        store[f] = val
+                    else:
+                        store.pop(f, None)
+                    mapping[f] = val
+            used = [c for c in mapping.values() if c]
+            dup = sorted({c for c in used if used.count(c) > 1})
+            if dup:
+                st.warning("Used for two fields: " + ", ".join(dup) + " — only the first will be applied.")
+            if store and st.button("Reset to automatic", key=f"reset_{token}"):
+                store.clear()
+                for k in [k for k in st.session_state if str(k).startswith(f"m_{token}_")]:
+                    del st.session_state[k]
+                st.rerun()
+    return mapping, set(store)
 
 
 def sidebar_upload():
@@ -2263,37 +2546,23 @@ def sidebar_upload():
         return None, f"Could not understand the layout of {up.name}: {exc}"
     if raw is None:
         return None, ("Could not find a time-series table in this file. " + " ".join(s_log[-2:]) +
-                      " Add an Anthropic API key under AI assistant to let Claude restructure unusual layouts.")
+                      " Connect Claude on the Ask FIELDWISE page to let it restructure unusual layouts.")
     sheet = "auto"
     auto, how = infer_cached(f"{token}|{sheet}", raw)
-
-    # --- Column mapping: automatic guess, every field correctable by the user
-    options = [NOT_IN_FILE] + [str(c) for c in raw.columns]
-    need_help = any(f not in auto for f in ["Date", "Well"]) or not ({"Oil_Rate", "Liquid_Rate"} & set(auto))
-    mapping, manual = {}, []
-    with st.sidebar.expander(f"Column mapping · {len(auto)} recognised", expanded=need_help):
-        st.caption("FIELDWISE matched your headers by name and by their values. Fix any wrong guess; "
-                   "* = required (oil can also be derived from liquid rate + water cut).")
-        for field in ALL_FIELDS:
-            guess = auto.get(field)
-            idx = options.index(guess) if guess in options else 0
-            label = field.replace("_", " ") + (" *" if field in REQUIRED else "")
-            sel = st.selectbox(label, options, index=idx, key=f"m_{token}_{sheet}_{field}",
-                               help=f"Auto: {how[field]}" if field in how else "Not found automatically")
-            mapping[field] = None if sel == NOT_IN_FILE else sel
-            if mapping[field] != guess:
-                manual.append(field)
+    mapping, manual = sidebar_columns(token, raw, auto, how)
 
     units, auto_units = {}, []
     present = [f for f in UNITS if mapping.get(f)]
-    with st.sidebar.expander("Source units", expanded=False):
-        st.caption("Detected from your column headers where possible — change any that are wrong.")
+    guesses = {c: detect_unit(mapping[c], c) or STD_UNIT[c] for c in present}
+    auto_units = [f"{FIELD_LABELS[c]}: {u}" for c, u in guesses.items() if u != STD_UNIT[c]]
+    with st.sidebar.expander("Units" + (f" · {len(auto_units)} converted" if auto_units else " · all standard"),
+                             expanded=False):
+        st.caption("The unit each column is in. Read from the header where it says (e.g. 'psi', 'bbl/d'); "
+                   "values are converted automatically. Change one only if it is wrong.")
         for col in present:
             keys = list(UNITS[col])
-            guess = detect_unit(mapping[col], col) or STD_UNIT[col]
-            if guess != STD_UNIT[col]:
-                auto_units.append(f"{col.replace('_', ' ')}: {guess}")
-            units[col] = st.selectbox(col.replace("_", " "), keys, index=keys.index(guess), key=f"u_{token}_{sheet}_{col}")
+            units[col] = st.selectbox(f"{FIELD_LABELS[col]}  ({mapping[col]})", keys, index=keys.index(guesses[col]),
+                                      key=f"u_{token}_{col}")
     map_key = tuple(sorted(mapping.items()))
     try:
         df, rep = clean_cached(f"{token}|{sheet}", raw, tuple(sorted(units.items())), map_key)
@@ -2302,8 +2571,8 @@ def sidebar_upload():
     if df is None:
         if rep.get("missing"):
             need = ", ".join(m.replace("_", " ") for m in rep["missing"])
-            return None, (f"Could not find: {need}. Open **Column mapping** in the sidebar and pick the matching "
-                          f"columns from your file (oil can also be derived from liquid rate + water cut).")
+            return None, (f"Could not find: {need}. Open **Columns** in the sidebar, turn on **Fix a column** and "
+                          f"pick it from your file (oil can also be calculated from liquid rate + water cut).")
         return None, rep.get("error", "The data could not be cleaned.")
     first = next(iter(grids.values()))
     rep = {**rep, "auto_units": auto_units, "structure_log": s_log, "structure_code": s_code,
@@ -2316,17 +2585,12 @@ def sidebar_upload():
 
 
 def sidebar_ai():
-    with st.sidebar.expander("AI assistant", expanded=False):
-        try:
-            import anthropic  # noqa: F401
-        except ImportError:
-            st.caption("Add `anthropic` to requirements.txt to enable Claude-powered answers.")
-            return
-        if _api_key() and not st.session_state.get("anthropic_key"):
-            st.caption("✅ API key loaded from secrets.")
-            return
-        st.text_input("Anthropic API key", type="password", key="anthropic_key",
-                      help="Kept only in this browser session. On Streamlit Cloud you can set ANTHROPIC_API_KEY in Secrets instead.")
+    if llm_available():
+        ok, _ = check_connection()          # cached per key + model: one tiny request per session
+        state = f"Claude connected ({llm_model()})" if ok else "key not working — see Ask FIELDWISE"
+    else:
+        state = "offline engine — connect Claude on Ask FIELDWISE"
+    st.sidebar.caption(f"🤖 AI assistant: {state}")
 
 
 def sidebar_settings() -> Settings:
