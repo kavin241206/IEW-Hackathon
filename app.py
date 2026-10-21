@@ -1260,6 +1260,370 @@ def rank_cached(key: str, _df, _dca, _eq, _s: Settings, settings_key: tuple):
     return rank_wells(_df, _dca, _eq, _s)
 
 
+# ---- 3g. FORECASTING — predict the next N periods of any measurement, per well -------------------
+FREQ_RULES = [(0.9, "h", "hour"), (1.5, "D", "day"), (10, "W", "week"), (45, "M", "month"), (120, "Q", "quarter"),
+              (1e9, "Y", "year")]
+DEFAULT_STEPS = {"h": 48, "D": 30, "W": 12, "M": 6, "Q": 4, "Y": 3}
+HELD_CONSTANT = {"Choke_Size", "Injection_Rate"}       # operator set-points: assumed unchanged unless the user plans otherwise
+NON_NEGATIVE = set(RATE_COLUMNS + PRESSURE_COLUMNS + ["Liquid_Rate", "Choke_Size"] + SENSOR_COLUMNS)
+FC_LABELS = {"Liquid_Rate": "Gross liquid rate", "Water_Cut": "Water cut"}
+FC_UNITS = {**STD_UNIT, "Water_Cut": "%", "Liquid_Rate": "m³/d"}
+SUMMABLE = set(RATE_COLUMNS + ["Liquid_Rate", "Energy_kWh"])   # field total = sum over wells (others: average)
+
+
+def detect_frequency(df: pd.DataFrame) -> tuple:
+    """Spacing of the data (hour / day / week / month / quarter / year) from the median gap within wells."""
+    gaps = df.sort_values(["Well", "Date"]).groupby("Well")["Date"].diff().dt.total_seconds() / 86400
+    gaps = gaps[gaps > 0]
+    med = float(gaps.median()) if len(gaps) else 1.0
+    for lim, code, label in FREQ_RULES:
+        if med <= lim:
+            return code, label
+    return "D", "day"
+
+
+def _to_period(dates: pd.Series, code: str) -> pd.Series:
+    try:
+        return dates.dt.to_period(code)
+    except (ValueError, TypeError):           # older pandas spells hourly 'H' and yearly 'A'
+        return dates.dt.to_period({"h": "H", "Y": "A"}.get(code, code))
+
+
+def _period_dates(periods: pd.PeriodIndex, last_date: pd.Timestamp, code: str) -> pd.DatetimeIndex:
+    """Period labels → dates in the same convention as the user's data (e.g. month-end, or Sunday weeks)."""
+    if code in ("M", "Q", "Y"):
+        return periods.to_timestamp(how="end").normalize() if last_date.is_month_end else periods.to_timestamp()
+    start = periods.to_timestamp()
+    return start + (last_date - start[-1])
+
+
+def _future_dates(last_date: pd.Timestamp, code: str, H: int) -> list:
+    if code in ("M", "Q", "Y"):
+        months = {"M": 1, "Q": 3, "Y": 12}[code]
+        if last_date.is_month_end:
+            return [last_date + pd.offsets.MonthEnd(months * k) for k in range(1, H + 1)]
+        return [last_date + pd.DateOffset(months=months * k) for k in range(1, H + 1)]
+    step = {"h": pd.Timedelta(hours=1), "D": pd.Timedelta(days=1), "W": pd.Timedelta(weeks=1)}[code]
+    return [last_date + step * k for k in range(1, H + 1)]
+
+
+def regular_series(d: pd.DataFrame, col: str, code: str) -> dict:
+    """{well: (values on a gap-free grid, last real date, period index)} — gaps interpolated, duplicates averaged."""
+    x = d[["Well", "Date", col]].dropna()
+    x = x.assign(P=_to_period(x["Date"], code))
+    out = {}
+    for w, g in x.groupby("Well", sort=True):
+        s = g.groupby("P")[col].mean()
+        if len(s) < 3:
+            continue
+        full = pd.period_range(s.index.min(), s.index.max(), freq=s.index.freq)
+        s = s.reindex(full).interpolate(limit_direction="both")
+        out[str(w)] = (s.to_numpy(dtype=float), g["Date"].max(), full)
+    return out
+
+
+# -- candidate methods (each returns H future values from a history array) --
+def _fc_level(y, H):
+    return np.full(H, float(np.mean(y[-3:])))
+
+
+def _fc_trend(y, H):
+    W = int(min(len(y), max(10, 3 * H)))
+    t = np.arange(W)
+    slope, icpt = np.polyfit(t, y[-W:], 1)
+    return icpt + slope * (W - 1 + np.arange(1, H + 1))
+
+
+def _fc_expdecline(y, H):
+    W = int(min(len(y), max(30, 4 * H)))
+    yy = y[-W:]
+    if (yy <= 0).any():
+        return None
+    slope, icpt = np.polyfit(np.arange(W), np.log(yy), 1)
+    if slope > 0:                                   # not declining → leave it to the trend methods
+        return None
+    return np.exp(icpt + slope * (W - 1 + np.arange(1, H + 1)))
+
+
+_HA, _HB, _HP = (g.ravel() for g in np.meshgrid([0.1, 0.25, 0.45, 0.7, 0.9], [0.02, 0.08, 0.2], [0.8, 0.9, 0.98]))
+
+
+def _fc_holt(y, H):
+    """Damped-trend exponential smoothing; all 45 parameter sets are fitted at once and the best one-step fit wins."""
+    y = y[-400:]
+    lvl = np.full(_HA.size, y[0])
+    tr = np.full(_HA.size, float(np.mean(np.diff(y[:6]))) if len(y) > 1 else 0.0)
+    sse = np.zeros(_HA.size)
+    for v in y[1:]:
+        f = lvl + _HP * tr
+        sse += (v - f) ** 2
+        new = _HA * v + (1 - _HA) * f
+        tr = _HB * (new - lvl) + (1 - _HB) * _HP * tr
+        lvl = new
+    i = int(np.argmin(sse))
+    return lvl[i] + tr[i] * np.cumsum(_HP[i] ** np.arange(1, H + 1))
+
+
+def _features(y):
+    """Shape of the recent history, scaled by the recent level (so one model can learn from wells of any size)."""
+    s = pd.Series(y)
+    m3, m7, m14, m30 = (s.rolling(k, min_periods=1).mean() for k in (3, 7, 14, 30))
+    sd7 = s.rolling(7, min_periods=2).std().fillna(0.0)
+    sl7 = (m3 - m3.shift(6)).fillna(0.0) / 6
+    sl30 = (m7 - m7.shift(23)).fillna(0.0) / 23
+    scale = (m30.abs() + 0.05 * s.abs().expanding().mean() + 1e-9).to_numpy()
+    F = np.column_stack([s, m3, m7, m14, sl7, sl30, sd7]) / scale[:, None]
+    return F, scale
+
+
+def _gb_train(histories: list, H: int):
+    """Global gradient-boosted model across all wells: predicts y[t+h] / level[t] from the recent shape and h."""
+    feats = [(_features(y), y) for y in histories if len(y) >= 20]
+    if not feats:
+        return None
+    cap = max(400, 60000 // H)
+    rng = np.random.default_rng(0)
+    Xs, Ys = [], []
+    for h in range(1, H + 1):
+        xs, ys = [], []
+        for (F, sc), y in feats:
+            idx = np.arange(10, len(y) - h)
+            if len(idx):
+                xs.append(np.column_stack([F[idx], np.full(len(idx), h)]))
+                ys.append(y[idx + h] / sc[idx])
+        if xs:
+            X, Y = np.vstack(xs), np.concatenate(ys)
+            if len(Y) > cap:
+                keep = rng.choice(len(Y), cap, replace=False)
+                X, Y = X[keep], Y[keep]
+            Xs.append(X)
+            Ys.append(Y)
+    if not Xs or sum(len(y) for y in Ys) < 300:
+        return None
+    model = HistGradientBoostingRegressor(max_iter=150, learning_rate=0.08, max_leaf_nodes=31,
+                                          l2_regularization=1.0, random_state=0)
+    return model.fit(np.vstack(Xs), np.concatenate(Ys))
+
+
+def _fc_gb_batch(model, hist: dict, H: int) -> dict:
+    """ML forecasts for every well in ONE predict call (much faster than one call per well)."""
+    if model is None or not hist:
+        return {}
+    wells, rows, scales = [], [], []
+    for w, y in hist.items():
+        if len(y) < 10:
+            continue
+        F, sc = _features(y)
+        wells.append(w)
+        rows.append(np.column_stack([np.tile(F[-1], (H, 1)), np.arange(1, H + 1)]))
+        scales.append(sc[-1])
+    if not wells:
+        return {}
+    pred = model.predict(np.vstack(rows)).reshape(len(wells), H) * np.asarray(scales)[:, None]
+    return dict(zip(wells, pred))
+
+
+def _candidates(y, H, held, gb_pred) -> dict:
+    if held:
+        return {"Held at current setting": np.full(H, float(y[-1]))}
+    out = {"Recent level": _fc_level(y, H), "Linear trend": _fc_trend(y, H)}
+    if len(y) >= 8:
+        out["Holt (damped trend)"] = _fc_holt(y, H)
+    e = _fc_expdecline(y, H)
+    if e is not None:
+        out["Exponential decline"] = e
+    if gb_pred is not None:
+        out["ML · boosted trees (all wells)"] = gb_pred
+    return {k: v for k, v in out.items() if np.isfinite(v).all()}
+
+
+def _blend(errs: dict) -> dict:
+    """Inverse-error weights over the two best methods (more stable than picking a single winner)."""
+    if not errs:
+        return {}
+    best = sorted(errs, key=errs.get)[:2]
+    inv = {m: 1.0 / (errs[m] + 1e-9) for m in best}
+    tot = sum(inv.values())
+    return {m: v / tot for m, v in inv.items()}
+
+
+def _combine(cands: dict, wts: dict) -> np.ndarray:
+    wts = {m: w for m, w in wts.items() if m in cands} or {next(iter(cands)): 1.0}
+    tot = sum(wts.values())
+    return sum(cands[m] * (w / tot) for m, w in wts.items())
+
+
+@st.cache_resource(show_spinner=False, max_entries=32)
+def forecast_series(key: str, var: str, H: int, code: str, _series: dict) -> dict:
+    """Rolling-origin blind test + weighted ensemble for one variable across all wells.
+
+    For k = 1, 2, 3 the last k·H periods are hidden; every method forecasts them from the remaining history
+    (the ML model is retrained without the hidden data). Methods are weighted by those errors. The most recent
+    window (k = 1) is scored with weights chosen on the OLDER windows only, so the reported accuracy is a true
+    blind test. Finally all methods are refitted on the full history to predict the next H periods."""
+    held = var in HELD_CONSTANT
+    ys = {w: v[0] for w, v in _series.items()}
+    nonneg = var in NON_NEGATIVE or all((y >= 0).all() for y in ys.values())
+    need = max(8, min(20, H + 5))
+    origins = [k for k in (1, 2, 3) if any(len(y) - k * H >= need for y in ys.values())]
+    cands, actual = {}, {}
+    for k in origins + [0]:
+        hist = {w: y[:len(y) - k * H] for w, y in ys.items() if len(y) - k * H >= (need if k else 3)}
+        gb = None
+        if not held and len(hist) and sum(len(h) for h in hist.values()) >= 60:
+            try:
+                gb = _gb_train(list(hist.values()), H)
+            except Exception:  # noqa: BLE001 — the other methods still run
+                gb = None
+        gb_preds = _fc_gb_batch(gb, hist, H)
+        for w, hy in hist.items():
+            cands[(w, k)] = _candidates(hy, H, held, gb_preds.get(w))
+            if k:
+                actual[(w, k)] = ys[w][len(ys[w]) - k * H: len(ys[w]) - k * H + H]
+
+    rows, blind, per_well, rel_err = [], {}, [], {h: [] for h in range(H)}
+    abs_e = abs_y = abs_base = 0.0
+    optimistic = False
+    for w, (y, last_date, periods) in _series.items():
+        ks = [k for k in origins if (w, k) in actual]
+        err = {k: {m: float(np.mean(np.abs(fc - actual[(w, k)]))) for m, fc in cands[(w, k)].items()} for k in ks}
+
+        def avg_err(use):
+            common = set.intersection(*(set(err[k]) for k in use)) if use else set()
+            return {m: float(np.mean([err[k][m] for k in use])) for m in common}
+
+        final_w = _blend(avg_err(ks)) if ks else {"Recent level": 1.0, "Held at current setting": 1.0}
+        acc_w = None
+        if 1 in ks:
+            older = [k for k in ks if k != 1]
+            bw = _blend(avg_err(older)) if older else _blend(avg_err([1]))
+            optimistic |= not older
+            pred = _combine(cands[(w, 1)], bw)
+            if nonneg:
+                pred = np.maximum(pred, 0)
+            act = actual[(w, 1)]
+            base = cands[(w, 1)].get("Recent level", cands[(w, 1)].get("Held at current setting"))
+            abs_e += float(np.abs(pred - act).sum())
+            abs_y += float(np.abs(act).sum())
+            abs_base += float(np.abs(base - act).sum())
+            acc_w = 100 * (1 - np.abs(pred - act).sum() / max(np.abs(act).sum(), 1e-9))
+            blind[w] = (_period_dates(periods, last_date, code)[-H:], act, pred)
+        for k in ks:                                     # error spread by horizon → P10/P90
+            p = _combine(cands[(w, k)], final_w)
+            rel = (actual[(w, k)] - p) / np.maximum(np.abs(p), 1e-6)
+            for h in range(H):
+                rel_err[h].append(rel[h])
+        fc = _combine(cands[(w, 0)], final_w)
+        if nonneg:
+            fc = np.maximum(fc, 0)
+        if var == "Water_Cut":
+            fc = np.clip(fc, 0, 100)
+        method = " + ".join(f"{m} {wt:.0%}" for m, wt in sorted(final_w.items(), key=lambda x: -x[1]) if m in cands[(w, 0)])
+        for h, (dt, v) in enumerate(zip(_future_dates(last_date, code, H), fc)):
+            rows.append((w, dt, h + 1, float(v), method))
+        per_well.append({"Well": w, "Blind-test accuracy (%)": acc_w, "History used": len(y), "Method": method})
+
+    # P10 / P90 from the blind-test error distribution at each horizon, widening monotonically with distance
+    lo, hi = np.zeros(H), np.zeros(H)
+    for h in range(H):
+        e = np.asarray(rel_err[h], dtype=float)
+        e = e[np.isfinite(e)]
+        if len(e) >= 8:
+            lo[h], hi[h] = np.quantile(e, 0.1), np.quantile(e, 0.9)
+        else:
+            lo[h], hi[h] = -0.05 * np.sqrt(h + 1), 0.05 * np.sqrt(h + 1)
+    lo, hi = np.minimum.accumulate(np.minimum(lo, 0)), np.maximum.accumulate(np.maximum(hi, 0))
+    fc = pd.DataFrame(rows, columns=["Well", "Date", "Step", "P50", "Method"])
+    fc["P10"] = fc["P50"] * (1 + lo[fc["Step"].to_numpy() - 1])
+    fc["P90"] = fc["P50"] * (1 + hi[fc["Step"].to_numpy() - 1])
+    if held:
+        fc["P10"] = fc["P90"] = fc["P50"]
+    if nonneg:
+        fc[["P10", "P50", "P90"]] = fc[["P10", "P50", "P90"]].clip(lower=0)
+    if var == "Water_Cut":
+        fc[["P10", "P50", "P90"]] = fc[["P10", "P50", "P90"]].clip(0, 100)
+    tested = abs_y > 0
+    return {
+        "fc": fc[["Well", "Date", "Step", "P10", "P50", "P90", "Method"]],
+        "blind": blind,
+        "per_well": pd.DataFrame(per_well),
+        "accuracy": 100 * (1 - abs_e / abs_y) if tested else np.nan,
+        "baseline": 100 * (1 - abs_base / abs_y) if tested else np.nan,
+        "tested_wells": len(blind), "optimistic": optimistic, "held": held,
+    }
+
+
+def forecastable(f: "Field") -> tuple:
+    """(enriched frame incl. extra numeric columns from the file, {column: label}) of everything that can be forecast."""
+    d = enrich(f.df)
+    opts = {}
+    for c in ["Oil_Rate", "Water_Rate", "Gas_Rate", "Liquid_Rate", "Water_Cut", "Wellhead_Pressure",
+              "Bottomhole_Pressure", "Injection_Rate", "Choke_Size"] + SENSOR_COLUMNS:
+        if c in d.columns and d[c].notna().mean() > 0.5 and d[c].nunique() > 1:
+            opts[c] = FC_LABELS.get(c) or FIELD_LABELS.get(c, c)
+    mapped = f.report.get("mapped", {})
+    if f.raw is not None and "Date" in mapped and "Well" in mapped:
+        used = set(mapped.values())
+        extra_cols = [c for c in f.raw.columns if str(c) not in used and
+                      pd.to_numeric(f.raw[c], errors="coerce").notna().mean() > 0.6]
+        if extra_cols:
+            ex = pd.DataFrame({"Date": smart_dates(f.raw[mapped["Date"]])[0],
+                               "Well": f.raw[mapped["Well"]].astype(str).str.strip().str.upper()})
+            for c in extra_cols:
+                ex[f"x::{c}"] = pd.to_numeric(f.raw[c], errors="coerce")
+            ex = ex.dropna(subset=["Date"]).groupby(["Well", "Date"], as_index=False).mean(numeric_only=True)
+            d = d.merge(ex, on=["Well", "Date"], how="left")
+            for c in extra_cols:
+                if d[f"x::{c}"].notna().mean() > 0.5 and d[f"x::{c}"].nunique() > 1:
+                    opts[f"x::{c}"] = f"{c}  (from your file)"
+    return d, opts
+
+
+def run_forecast(f: "Field", var: str, H: int, d: pd.DataFrame | None = None) -> dict | None:
+    if d is None:
+        d, _ = forecastable(f)
+    if var not in d.columns:
+        return None
+    code, _ = detect_frequency(f.df)
+    series = regular_series(d, var, code)
+    if not series:
+        return None
+    return forecast_series(f"{f.key}|{var}|{code}", var, int(H), code, series)
+
+
+def fc_unit(var: str) -> str:
+    return "" if var.startswith("x::") else FC_UNITS.get(var, "")
+
+
+def fc_label(var: str) -> str:
+    return var[3:] if var.startswith("x::") else FC_LABELS.get(var, FIELD_LABELS.get(var, var))
+
+
+def to_source_units(var: str, values, report: dict):
+    """Convert standard-unit values back into the unit the user's file used (for export)."""
+    conv = {c["Field"]: c["From"] for c in report.get("conversions", [])}
+    unit = conv.get(var)
+    if not unit or var not in UNITS:
+        return values, fc_unit(var)
+    offset = -32.0 * 5.0 / 9.0 if unit == "°F" else 0.0
+    return (np.asarray(values, dtype=float) - offset) / UNITS[var][unit], unit
+
+
+def steps_from_text(text: str, code: str, default: int) -> int:
+    """'next 3 months' with daily data → 90 steps, etc."""
+    m = re.search(r"(?:next|coming|following)\s+(\d+)\s*(hour|day|week|month|quarter|year)s?", text.lower())
+    if not m:
+        m2 = re.search(r"(?:next|coming|following)\s+(hour|day|week|month|quarter|year)\b", text.lower())
+        if not m2:
+            return default
+        n, unit = 1, m2.group(1)
+    else:
+        n, unit = int(m.group(1)), m.group(2)
+    days = {"hour": 1 / 24, "day": 1, "week": 7, "month": 30.44, "quarter": 91.3, "year": 365.25}
+    per = {"h": 1 / 24, "D": 1, "W": 7, "M": 30.44, "Q": 91.3, "Y": 365.25}[code]
+    return int(max(1, min(365, round(n * days[unit] / per))))
+
+
 # ---- 3f. Ask FIELDWISE — answer free-form questions about the uploaded sheet ---------
 LLM_MODELS = {  # API model IDs (platform.claude.com/docs/en/models/overview)
     "claude-sonnet-5-5": "Sonnet 5.5 — balanced (recommended)",
@@ -1290,6 +1654,11 @@ itertools, scipy, plotly.express or plotly.graph_objects — nothing else):
 - ranked: one row per well (latest 7-day averages) with Oil_Rate, Water_Rate, Water_Cut (%), Priority, Why,
   Status (equipment), Decline (%/yr).
 - decline: per-well Arps decline table.     - pd, np, px, go already imported.
+- forecast(variable, steps=None): FIELDWISE's validated forecasting model. Returns a DataFrame with Well, Date,
+  Step, P10, P50, P90 (P50 = most likely) for the next `steps` periods of the data's own spacing, plus
+  .attrs["accuracy"] = blind-test accuracy %. `variable` is a df column (e.g. "Oil_Rate", "Water_Rate",
+  "Water_Cut", "Liquid_Rate", "Bottomhole_Pressure") or an original raw column name. ALWAYS use it for any
+  prediction / forecast / "next N days/months" question instead of writing your own model; mention the accuracy.
 
 Useful knowledge: water cut = qw/(qo+qw); GOR = qg/qo; WOR = qw/qo; liquid = qo+qw; cumulative volume =
 Σ(rate × days between samples); 1 m³ = 6.2898 bbl; 1 Sm³ = 35.3147 scf; 1 bar = 14.5038 psi;
@@ -1406,16 +1775,16 @@ def explain_api_error(exc: Exception, model: str = "") -> str:
     msg = str(getattr(exc, "message", "") or exc)
     low, name = msg.lower(), type(exc).__name__
     if status == 402 or "credit balance" in low or "billing" in low:
-        return ("Your Anthropic account has no API credit. Add credit at console.anthropic.com → Billing "
+        return ("Your Anthropic account has no API credit. Add credit at platform.claude.com → Billing "
                 "(API usage is billed separately from a Claude.ai subscription).")
     if status == 401 or "authentication" in name.lower() or "x-api-key" in low:
-        return "The API key was rejected. Copy it again from console.anthropic.com → API keys (it starts with sk-ant-)."
+        return "The API key was rejected. Copy it again from platform.claude.com/settings/keys (it starts with sk-ant-)."
     if status == 403:
-        return "This API key doesn't have permission for that request — check its workspace in the Anthropic Console."
+        return "This API key doesn't have permission for that request — check its workspace in the Claude Console (platform.claude.com)."
     if status == 404 or "not_found" in low:
         return f"Model '{model}' isn't available to this key — pick another model below."
     if status == 429:
-        return "Rate or spend limit reached for this key. Wait a minute, or raise the limit in the Anthropic Console."
+        return "Rate or spend limit reached for this key. Wait a minute, or raise the limit in the Claude Console (platform.claude.com)."
     if status in (500, 529) or "overloaded" in low:
         return "Claude is busy right now. Try again in a moment."
     if "connection" in name.lower() or "timeout" in name.lower():
@@ -1531,6 +1900,49 @@ _QUANTITIES = [  # (keywords, label, how to compute from a frame, unit, is_rate)
 ]
 
 
+def _offline_forecast(question: str, q: str, f: "Field", named: list) -> dict:
+    code, per = detect_frequency(f.df)
+    steps = steps_from_text(question, code, DEFAULT_STEPS.get(code, 12))
+    pick = [("water cut", "Water_Cut"), ("liquid", "Liquid_Rate"), ("gross", "Liquid_Rate"), ("water", "Water_Rate"),
+            ("gas lift", "Injection_Rate"), ("lift gas", "Injection_Rate"), ("gas", "Gas_Rate"),
+            ("bottom", "Bottomhole_Pressure"), ("bhp", "Bottomhole_Pressure"), ("wellhead", "Wellhead_Pressure"),
+            ("whp", "Wellhead_Pressure"), ("thp", "Wellhead_Pressure"), ("vibration", "Pump_Vibration"),
+            ("temperature", "Motor_Temperature"), ("current", "Motor_Current"), ("energy", "Energy_kWh")]
+    d, opts = forecastable(f)
+    var = None
+    for x in opts:                                  # the file's own extra columns, matched by their words
+        if x.startswith("x::"):
+            words = [w for w in re.findall(r"[a-z]+", _strip_units(x[3:])) if len(w) > 3]
+            if words and any(f" {w}" in q for w in words):
+                var = x
+                break
+    var = var or next((v for k, v in pick if f" {k}" in q), "Oil_Rate")
+    if var not in opts:
+        return {"engine": "Offline engine · forecasting model", "result": None, "fig": None,
+                "answer": f"This file has no usable {fc_label(var).lower()} data to forecast. I can forecast: "
+                          f"{', '.join(opts.values())}."}
+    r = run_forecast(f, var, steps, d)
+    if r is None:
+        return {"engine": "Offline engine", "result": None, "fig": None,
+                "answer": f"Not enough history to forecast {fc_label(var).lower()}."}
+    fc = r["fc"] if not named else r["fc"][r["fc"]["Well"].isin(named)]
+    agg = "sum" if var in SUMMABLE else "mean"
+    tot = fc.groupby("Date")[["P10", "P50", "P90"]].agg(agg).reset_index()
+    unit = fc_unit(var)
+    scope = (", ".join(named) if named else "the field") + \
+        ("" if len(named) == 1 else (" (sum of wells)" if agg == "sum" else " (average of wells)"))
+    vol = f" — about **{tot['P50'].sum():,.0f} {unit.replace('/d', '')}** in total" if unit.endswith("/d") and per == "day" else ""
+    ans = (f"Predicted {fc_label(var).lower()} for {scope}, next **{steps} {per}s**: average **{tot['P50'].mean():,.1f} {unit}**"
+           f" (likely range {tot['P10'].mean():,.1f}–{tot['P90'].mean():,.1f}){vol}. "
+           f"Blind-test accuracy {fmt(r['accuracy'], '.1f', '%')} on the last {steps} {per}s. See the Forecast page for details.")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=list(tot.Date) + list(tot.Date[::-1]), y=list(tot.P90) + list(tot.P10[::-1]), fill="toself",
+                             fillcolor="rgba(251,191,36,.15)", line=dict(width=0), name="Likely range"))
+    fig.add_trace(go.Scatter(x=tot.Date, y=tot.P50, name="Forecast", line=dict(color=COLORS["amber"], dash="dash")))
+    per_well = fc.pivot_table(index="Well", values="P50", aggfunc="mean").rename(columns={"P50": f"Avg next {steps} {per}s"})
+    return {"engine": "Offline engine · forecasting model", "answer": ans, "result": per_well.reset_index(), "fig": fig}
+
+
 def ask_offline(question: str, f: "Field") -> dict:
     canon = lambda t: " " + " ".join(re.sub(r"[^a-z0-9&]+", " ", str(t).lower()).split()) + " "  # noqa: E731
     q = canon(question)
@@ -1547,6 +1959,9 @@ def ask_offline(question: str, f: "Field") -> dict:
         d = d[d["Date"].dt.year == int(y)]
     if d.empty:
         return {"engine": "Offline engine", "answer": "No rows match that well / period.", "result": None, "fig": None}
+    if re.search(r"\b(predict|prediction|forecast|projection|project|future|will be|expected|next \d*\s*"
+                 r"(hour|day|week|month|quarter|year))", q):
+        return _offline_forecast(question, q, f, named)
 
     # Which quantity? built-in engineering quantities first, then any other column in the sheet by name similarity
     declining = any(k in q for k in ("declin", "dropping", "falling", "decreas"))
@@ -2038,9 +2453,177 @@ def page_model(f: Field, vfm):
          "never used as inputs.")
 
 
+def _fc_export(f: Field, results: dict, H: int) -> tuple:
+    """(table in standard units, table in the user's own column names + units, range table)."""
+    std, own, rng_rows = None, None, None
+    mapped = f.report.get("mapped", {})
+    for var, r in results.items():
+        fc = r["fc"]
+        lab = f"{fc_label(var)}" + (f" ({fc_unit(var)})" if fc_unit(var) else "")
+        part = fc[["Well", "Date", "P50"]].rename(columns={"P50": lab})
+        std = part if std is None else std.merge(part, on=["Well", "Date"], how="outer")
+        vals, unit = to_source_units(var, fc["P50"].to_numpy(), f.report)
+        head = var[3:] if var.startswith("x::") else mapped.get(var, fc_label(var) + (f" ({unit})" if unit else ""))
+        o = pd.DataFrame({"Well": fc["Well"], "Date": fc["Date"], head: vals})
+        own = o if own is None else own.merge(o, on=["Well", "Date"], how="outer")
+        lo, _ = to_source_units(var, fc["P10"].to_numpy(), f.report)
+        hi, _ = to_source_units(var, fc["P90"].to_numpy(), f.report)
+        rr = pd.DataFrame({"Well": fc["Well"], "Date": fc["Date"], f"{head} P10": lo, f"{head} P50": vals, f"{head} P90": hi})
+        rng_rows = rr if rng_rows is None else rng_rows.merge(rr, on=["Well", "Date"], how="outer")
+    date_h, well_h = mapped.get("Date", "Date"), mapped.get("Well", "Well")
+    own = own.rename(columns={"Date": date_h, "Well": well_h})[[date_h, well_h] + [c for c in own.columns if c not in ("Well", "Date")]]
+    rng_rows = rng_rows.rename(columns={"Date": date_h, "Well": well_h})
+    return std.sort_values(["Well", "Date"]), own.sort_values([well_h, date_h]), rng_rows.sort_values([well_h, date_h])
+
+
+def _xlsx_bytes(sheets: dict) -> bytes | None:
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+            for name, frame in sheets.items():
+                frame.to_excel(xw, index=False, sheet_name=name[:31])
+        return buf.getvalue()
+    except ImportError:
+        return None
+
+
+@_fragment
+def page_forecast(f: Field):
+    code, per = detect_frequency(f.df)
+    d, opts = forecastable(f)
+    page_header("Forecast", f"Predicts the next {per}s for every well. Each method is tested on recent {per}s it was "
+                "not allowed to see; the best ones are blended for the forecast.", f"your data: one value per {per}")
+    if not opts:
+        st.info("No numeric measurements with enough history to forecast.")
+        return
+    n_med = int(d.groupby("Well").size().median())
+    max_steps = int(max(1, min(365, n_med // 2)))
+    c1, c2 = st.columns([2.2, 1])
+    with c1:
+        default = [v for v in ("Oil_Rate", "Water_Rate", "Gas_Rate") if v in opts][:3] or list(opts)[:1]
+        chosen = st.multiselect("What to predict", list(opts), default=default, format_func=lambda v: opts[v],
+                                key="fc_vars")
+    with c2:
+        H = int(st.number_input(f"How many {per}s ahead", min_value=1, max_value=max_steps,
+                                value=min(DEFAULT_STEPS.get(code, 12), max_steps, max(1, n_med // 4)), step=1, key="fc_h"))
+    if not chosen:
+        st.info("Pick at least one measurement to predict.")
+        return
+    results = {}
+    with st.spinner(f"Training and blind-testing {len(chosen)} forecast model(s)…"):
+        for v in chosen:
+            try:
+                r = run_forecast(f, v, H, d)
+            except Exception as exc:  # noqa: BLE001 — one bad column must not stop the others
+                st.warning(f"{opts[v]}: could not be forecast ({exc}).")
+                r = None
+            if r is not None and len(r["fc"]):
+                results[v] = r
+    if not results:
+        st.warning("Not enough history to forecast the selected measurements (each well needs at least 3 points).")
+        return
+    main_v = next(iter(results))
+    r0, unit0 = results[main_v], fc_unit(main_v)
+    agg = "sum" if main_v in SUMMABLE else "mean"
+    hist = d.groupby("Date")[main_v].agg(agg)
+    fut = r0["fc"].groupby("Date")[["P10", "P50", "P90"]].agg(agg)
+    recent = float(hist.tail(H).mean()) if len(hist) else np.nan
+    nxt = float(fut["P50"].mean())
+    chg = (nxt / recent - 1) * 100 if recent else np.nan
+    word = "Field total" if agg == "sum" else "Field average"
+    acc, base = r0["accuracy"], r0["baseline"]
+    kpi_row([(f"{fc_label(main_v)} · next {H} {per}s", f"{nxt:,.1f} {unit0}", f"{word.lower()}, mean per {per}"),
+             ("Change vs last period", fmt(chg, "+.1f", "%"), f"vs the last {H} {per}s", "warn" if chg < -5 else ""),
+             ("Likely range (P10–P90)", f"{fut['P10'].mean():,.0f} – {fut['P90'].mean():,.0f}", unit0),
+             ("Blind-test accuracy", fmt(acc, ".1f", "%"), f"on the last {H} {per}s it never saw",
+              "good" if acc >= 90 else "warn"),
+             ("vs last-value guess", fmt(acc - base, "+.1f", " pts"), f"naive accuracy {fmt(base, '.1f', '%')}",
+              "good" if acc >= base else "")])
+    if np.isfinite(acc):
+        insight(f"To prove it works, FIELDWISE hid the last <b>{H} {per}s</b> of every well, predicted them, and "
+                f"compared with what really happened: <b>{acc:.1f}% accurate</b> for {esc(fc_label(main_v).lower())} "
+                f"across {r0['tested_wells']} wells (simply repeating the last value scores {base:.1f}%). It then "
+                f"retrained on all data to predict the next {H} {per}s."
+                + (" <i>Short history: methods were chosen on the same window they were scored on, so this accuracy "
+                   "is slightly optimistic.</i>" if r0["optimistic"] else ""))
+    else:
+        note(f"History is too short for a blind test at {H} {per}s ahead — forecasts use simple trend methods. "
+             "Try fewer steps ahead for a tested forecast.", warn=True)
+
+    a, b = st.columns([1.35, 1], gap="large")
+    with a:
+        card_header(f"{word} · {fc_label(main_v)}", f"history and forecast · shaded = likely range (P10–P90)")
+        show = hist.tail(max(4 * H, 60))
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=list(fut.index) + list(fut.index[::-1]), y=list(fut["P90"]) + list(fut["P10"][::-1]),
+                                 fill="toself", fillcolor="rgba(251,191,36,.15)", line=dict(width=0),
+                                 name="Likely range", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=show.index, y=show.values, name="Actual", line=dict(color=COLORS["teal"], width=2)))
+        fig.add_trace(go.Scatter(x=fut.index, y=fut["P50"], name="Forecast", line=dict(color=COLORS["amber"], width=2.4, dash="dash")))
+        chart(fig, 380, yaxis_title=unit0 or None)
+    with b:
+        card_header("Forecast accuracy by measurement", f"blind test · last {H} {per}s hidden")
+        acc_rows = []
+        for v, r in results.items():
+            mix = (r["per_well"]["Method"].str.split(r" \+ ").explode().str.replace(r" \d+%$", "", regex=True)
+                   .value_counts().head(2).index.tolist())
+            acc_rows.append({"Measurement": fc_label(v), "Blind accuracy (%)": r["accuracy"],
+                             "Last-value guess (%)": r["baseline"], "Wells tested": r["tested_wells"],
+                             "Main methods": ", ".join(mix)})
+        table(pd.DataFrame(acc_rows), 1, height=min(380, 40 + 36 * len(acc_rows)))
+
+    card_header("Check one well", "the dashed purple line is what the model predicted for the hidden period — "
+                "compare it with the actual line")
+    c1, c2 = st.columns(2)
+    with c1:
+        v_sel = st.selectbox("Measurement", list(results), format_func=lambda v: opts[v], key="fc_one_var")
+    rv = results[v_sel]
+    wells = sorted(rv["fc"]["Well"].unique())
+    with c2:
+        w_sel = st.selectbox("Well", wells, key="fc_one_well")
+    g = d[d["Well"] == w_sel].sort_values("Date")
+    fw = rv["fc"][rv["fc"]["Well"] == w_sel]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=list(fw.Date) + list(fw.Date[::-1]), y=list(fw.P90) + list(fw.P10[::-1]), fill="toself",
+                             fillcolor="rgba(251,191,36,.15)", line=dict(width=0), name="Likely range", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=g.Date, y=g[v_sel], name="Actual", line=dict(color=COLORS["teal"], width=1.8)))
+    if w_sel in rv["blind"]:
+        bd, _, bp = rv["blind"][w_sel]
+        fig.add_trace(go.Scatter(x=bd, y=bp, name="Blind-test prediction", line=dict(color=COLORS["violet"], width=2.2, dash="dot")))
+    fig.add_trace(go.Scatter(x=fw.Date, y=fw.P50, name="Forecast", line=dict(color=COLORS["amber"], width=2.4, dash="dash")))
+    chart(fig, 360, yaxis_title=fc_unit(v_sel) or None)
+    pw = rv["per_well"][rv["per_well"]["Well"] == w_sel]
+    if len(pw):
+        st.caption(f"{w_sel}: blind-test accuracy {fmt(pw['Blind-test accuracy (%)'].iloc[0], '.1f', '%')} · "
+                   f"method: {pw['Method'].iloc[0]}")
+
+    std_t, own_t, rng_t = _fc_export(f, results, H)
+    card_header("Forecast table", f"next {H} {per}s for every well · P50 = most likely value")
+    table(std_t, 2, height=360)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.download_button("⬇ Forecast · your file's format (CSV)", own_t.to_csv(index=False).encode(),
+                           "fieldwise_forecast.csv", "text/csv", **W,
+                           help="Same column names and units as your uploaded file — ready to compare with actuals.")
+    with c2:
+        xb = _xlsx_bytes({"Forecast": own_t, "Range P10-P50-P90": rng_t, "Standard units": std_t,
+                          "Accuracy": pd.DataFrame(acc_rows)})
+        if xb:
+            st.download_button("⬇ Forecast workbook (Excel)", xb, "fieldwise_forecast.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", **W)
+    with c3:
+        st.download_button("⬇ With P10 / P90 range (CSV)", rng_t.to_csv(index=False).encode(),
+                           "fieldwise_forecast_range.csv", "text/csv", **W)
+    note("<b>Assumptions.</b> Wells keep operating as they have recently: no new wells, workovers or planned "
+         "shut-ins; choke size and lift gas stay at current settings. P10–P90 is the range that contained 80% of "
+         "the blind-test errors at each step ahead. Methods: recent level, linear trend, damped-trend exponential "
+         "smoothing, exponential decline, and a gradient-boosted model trained across all wells.")
+
+
 @_fragment
 def page_decline(f: Field, dca, fc):
-    page_header("Decline Curves & Forecast", "Arps decline fitted to each well's 7-day average oil rate.", "180-day horizon")
+    page_header("Decline Curves", "Arps decline fitted to each well's 7-day average oil rate — the classic reservoir-"
+                "engineering view (for tested, any-measurement predictions use the Forecast page).", "180-day decline outlook")
     if dca.empty:
         st.info("Not enough history per well to fit decline curves.")
         return
@@ -2275,7 +2858,7 @@ def page_quality(f: Field):
     st.download_button("⬇ Download clean data (CSV)", f.df.to_csv(index=False).encode(), "fieldwise_clean.csv", "text/csv")
 
 
-EXAMPLE_QUESTIONS = ["Which well has the highest gas-oil ratio?", "Total oil produced by each well in the last 30 days",
+EXAMPLE_QUESTIONS = ["Predict oil production for the next 30 days", "Total oil produced by each well in the last 30 days",
                      "Which wells are declining?", "Average water cut per well",
                      "Show the oil rate trend of the top-priority well", "What is the energy used per barrel for each well?"]
 
@@ -2343,7 +2926,7 @@ def ai_connection_panel() -> tuple:
                 _save_model()
                 ok, why = check_connection(force=True)
                 (st.success if ok else st.error)(why)
-        st.caption("Get a key at console.anthropic.com → API keys, and add a little credit under Billing — "
+        st.caption("Get a key at platform.claude.com/settings/keys, and add a little credit under Billing — "
                    "each question costs a fraction of a cent.")
     return ok, why
 
@@ -2362,7 +2945,8 @@ def page_ask(f: Field, ranked, dca):
                 st.session_state["ask_q"] = ex.replace("the top-priority well", str(ranked.iloc[0]["Well"]))
     q = st.text_input("Your question", key="ask_q", placeholder="e.g. Which well had the biggest drop in oil last month?")
     if st.button("Ask", type="primary") and q.strip():
-        env = {"raw": f.raw, "df": f.df, "ranked": ranked, "decline": dca, "pd": pd, "np": np, "px": px, "go": go}
+        env = {"raw": f.raw, "df": f.df, "ranked": ranked, "decline": dca, "pd": pd, "np": np, "px": px, "go": go,
+               "forecast": make_forecast_tool(f)}
         with st.spinner("Claude is working out the answer…" if smart else "Calculating…"):
             out, reason = None, (why_not if (not smart and _api_key()) else None)
             if smart:
@@ -2384,13 +2968,35 @@ def page_ask(f: Field, ranked, dca):
         _render_result(item)
 
 
+def make_forecast_tool(f: Field):
+    """forecast(variable, steps) for Claude-written analyses — runs the validated forecasting engine."""
+    code, _ = detect_frequency(f.df)
+    d, opts = forecastable(f)
+
+    def forecast(variable: str, steps: int | None = None) -> pd.DataFrame:
+        var = str(variable)
+        if var not in d.columns:
+            var = f"x::{variable}" if f"x::{variable}" in d.columns else next(
+                (k for k, lab in opts.items() if lab.lower().startswith(str(variable).lower())), var)
+        r = run_forecast(f, var, int(steps or DEFAULT_STEPS.get(code, 12)), d)
+        if r is None:
+            raise ValueError(f"cannot forecast '{variable}' — choose one of: {', '.join(k.replace('x::', '') for k in opts)}")
+        out = r["fc"].drop(columns=["Method"]).copy()
+        out.attrs["accuracy"] = r["accuracy"]
+        return out
+    return forecast
+
+
 def page_method():
     page_header("Methodology", "How FIELDWISE AI answers Problem Statement 3.")
     rows = [("Manual data collation", "Ingestion & quality gate",
              "Recognises common header variants, converts units (psi, bbl/d, inch chokes …), repairs and logs every change."),
             ("Periodic well testing", "AI virtual flow meter",
              "Gradient boosting + extra trees infer daily oil from pressures, choke size, lift gas and pump signals between tests."),
-            ("Declining reservoir pressure", "Decline curves", "Arps decline per well, 180-day forecast and decline ranking."),
+            ("Declining reservoir pressure", "Decline curves", "Arps decline per well, 180-day outlook and decline ranking."),
+            ("Predicting future production", "Forecast",
+             "Recent level, trend, damped exponential smoothing, exponential decline and a boosted-tree model across all "
+             "wells compete in a rolling blind test; the best are blended, with a P10–P90 range from the test errors."),
             ("Sub-optimal lift-gas allocation", "Lift-gas optimiser",
              "Per-well gas-lift performance curves + exact dynamic programme under the field gas limit."),
             ("Frequent pump burnouts", "Equipment early warning",
@@ -2408,7 +3014,8 @@ def page_method():
 # =============================================================================
 # 7. MAIN
 # =============================================================================
-PAGES = {"Command Centre": "📊", "Ask FIELDWISE": "💬", "AI Production Model": "🧠", "Decline & Forecast": "📉", "Lift-Gas Optimiser": "⚖️",
+PAGES = {"Command Centre": "📊", "Ask FIELDWISE": "💬", "Forecast": "🔮", "AI Production Model": "🧠",
+         "Decline Curves": "📉", "Lift-Gas Optimiser": "⚖️",
          "Equipment Health": "🛠️", "Well Explorer": "🔎", "Data & Quality": "🧹", "Methodology": "📘"}
 
 
@@ -2646,7 +3253,9 @@ def main():
         page_ask(field, ranked, dca)
     elif page == "AI Production Model":
         page_model(field, vfm)
-    elif page == "Decline & Forecast":
+    elif page == "Forecast":
+        page_forecast(field)
+    elif page == "Decline Curves":
         page_decline(field, dca, fc)
     elif page == "Lift-Gas Optimiser":
         page_lift(field, curves, skipped)
